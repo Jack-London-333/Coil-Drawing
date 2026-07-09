@@ -1,0 +1,25 @@
+[project]
+name = "coildrawing"
+version = "0.1.0"
+description = "交流电机定子成型线圈参数计算与三维建模工具（基于专利 CN104965948B 公式体系）"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "build123d>=0.11.1",
+    "matplotlib>=3.11.0",
+    "openpyxl>=3.1.5",
+    "pyside6>=6.11.1",
+]
+
+[dependency-groups]
+dev = [
+    "pymupdf>=1.28.0",
+    "pytest>=9.1.1",
+]
+
+[project.scripts]
+coildrawing = "coildrawing.ui:main"
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.10"]
+build-backend = "uv_build"
