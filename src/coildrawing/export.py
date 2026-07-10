@@ -51,7 +51,19 @@ def input_rows(inp: CoilInput) -> list[tuple[str, str, str, str]]:
         ("ξ", "迭代误差设定值", f"{inp.xi:g}", ""),
     ]
     for i, layer in enumerate(inp.layers, start=1):
-        rows.append((f"绝缘层{i}", layer.name, f"{layer.thickness:g}", "mm"))
+        rows.append((f"对地层{i}", layer.name, f"{layer.thickness:g}", "mm"))
+    for i, layer in enumerate(inp.turn_layers, start=1):
+        rows.append((f"匝绝缘层{i}", layer.name, f"{layer.thickness:g}", "mm"))
+    rows += [
+        ("rlead", "引线折弯半径", f"{inp.lead_bend_r:g}", "mm"),
+        ("Lbare", "引线端头裸铜长", f"{inp.lead_bare:g}", "mm"),
+        ("防晕", "槽部防晕层(3D)", "启用" if inp.corona_on else "关闭", ""),
+    ]
+    if inp.corona_on:
+        rows += [
+            ("Tcor", "防晕层单边厚度", f"{inp.corona_t:g}", "mm"),
+            ("Lcor+", "防晕层每端伸出铁芯", f"{inp.corona_overhang:g}", "mm"),
+        ]
     return rows
 
 

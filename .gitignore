@@ -11,3 +11,10 @@ wheels/
 
 # 生成的输出文件
 output/
+
+# 3D模型及工程图
+*.step
+*.SLDPRT
+*.SLDASM
+*.SLDDRW
+

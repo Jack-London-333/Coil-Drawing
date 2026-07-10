@@ -16,10 +16,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QApplication, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QStatusBar, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QStatusBar,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from .engine import CoilInput, CoilResult, InsulationLayer, WireSpec, compute
@@ -32,7 +32,7 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import (  # noqa: E402
     FigureCanvasQTAgg, NavigationToolbar2QT)
 
-from .drawing2d import make_figure, save_png  # noqa: E402
+from .drawing2d import make_figure, save_figure  # noqa: E402
 
 
 # ----------------------------------------------------------------------
@@ -75,6 +75,74 @@ def _ispin(val: int, lo=0, hi=100000) -> QSpinBox:
     sp.setValue(val)
     sp.setAlignment(Qt.AlignRight)
     return sp
+
+
+class LayerTableGroup(QGroupBox):
+    """绝缘分层编辑表（名称 + 单边厚度），带增删按钮与总厚提示。"""
+
+    def __init__(self, title: str, sum_hint: str, parent=None):
+        super().__init__(title, parent)
+        self._sum_hint = sum_hint
+        v = QVBoxLayout(self)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["层名称", "单边厚度 mm"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setMinimumHeight(90)
+        v.addWidget(self.table)
+        hb = QHBoxLayout()
+        btn_add = QPushButton("＋ 添加层")
+        btn_del = QPushButton("－ 删除选中层")
+        btn_add.clicked.connect(self.add_row)
+        btn_del.clicked.connect(self.del_row)
+        hb.addWidget(btn_add)
+        hb.addWidget(btn_del)
+        hb.addStretch(1)
+        self.lbl_sum = QLabel()
+        hb.addWidget(self.lbl_sum)
+        v.addLayout(hb)
+        self.table.itemChanged.connect(lambda *_: self.update_sum())
+        self.update_sum()
+
+    def add_row(self, name: str | bool = False, t: float = 0.5) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        label = name if isinstance(name, str) else f"绝缘层 {row + 1}"
+        self.table.setItem(row, 0, QTableWidgetItem(label))
+        item_t = QTableWidgetItem(f"{t:g}")
+        item_t.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table.setItem(row, 1, item_t)
+        self.update_sum()
+
+    def del_row(self) -> None:
+        rows = sorted({i.row() for i in self.table.selectedItems()}, reverse=True)
+        if not rows and self.table.rowCount():
+            rows = [self.table.rowCount() - 1]
+        for r in rows:
+            self.table.removeRow(r)
+        self.update_sum()
+
+    def set_layers(self, layers: list[InsulationLayer]) -> None:
+        self.table.setRowCount(0)
+        for layer in layers:
+            self.add_row(layer.name, layer.thickness)
+
+    def layers(self) -> list[InsulationLayer]:
+        out = []
+        for r in range(self.table.rowCount()):
+            name_item = self.table.item(r, 0)
+            t_item = self.table.item(r, 1)
+            name = name_item.text().strip() if name_item else f"绝缘层 {r + 1}"
+            try:
+                t = float(t_item.text()) if t_item else 0.0
+            except ValueError:
+                t = 0.0
+            out.append(InsulationLayer(name or f"绝缘层 {r + 1}", t))
+        return out
+
+    def update_sum(self) -> None:
+        s = sum(l.thickness for l in self.layers())
+        self.lbl_sum.setText(f"分层总厚：{s:.2f} mm（{self._sum_hint}）")
 
 
 class MainWindow(QMainWindow):
@@ -171,29 +239,33 @@ class MainWindow(QMainWindow):
         f3.addRow("槽内防晕层 CS", self.in_cs)
 
         # --- 3D 绝缘分层表 ---
-        g4 = QGroupBox("三维模型对地绝缘分层（云母带等，由内到外）")
-        v4 = QVBoxLayout(g4)
-        self.layer_table = QTableWidget(0, 2)
-        self.layer_table.setHorizontalHeaderLabels(["层名称", "单边厚度 mm"])
-        self.layer_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.layer_table.verticalHeader().setVisible(False)
-        self.layer_table.setMinimumHeight(120)
-        v4.addWidget(self.layer_table)
-        hb = QHBoxLayout()
-        btn_add = QPushButton("＋ 添加层")
-        btn_del = QPushButton("－ 删除选中层")
-        btn_add.clicked.connect(self._add_layer_row)
-        btn_del.clicked.connect(self._del_layer_row)
-        hb.addWidget(btn_add)
-        hb.addWidget(btn_del)
-        hb.addStretch(1)
-        self.lbl_layer_sum = QLabel("分层总厚：0.00 mm")
-        hb.addWidget(self.lbl_layer_sum)
-        v4.addLayout(hb)
-        form_v.addWidget(g4)
-        self.layer_table.itemChanged.connect(lambda *_: self._update_layer_sum())
-        for name, t in [("对地云母带 1", 0.55), ("对地云母带 2", 0.55)]:
-            self._add_layer_row(name, t)
+        self.grp_ground = LayerTableGroup(
+            "三维模型对地绝缘分层（云母带等，由内到外）", "应≈对地绝缘 T2")
+        form_v.addWidget(self.grp_ground)
+        self.grp_ground.set_layers([InsulationLayer("对地云母带 1", 0.55),
+                                    InsulationLayer("对地云母带 2", 0.55)])
+
+        self.grp_turn = LayerTableGroup(
+            "三维模型匝绝缘分层（包每匝导线束，由内到外）", "应≈匝间绝缘 T1")
+        form_v.addWidget(self.grp_turn)
+        self.grp_turn.set_layers([InsulationLayer("匝间云母带", 0.15)])
+
+        # --- 三维模型选项 ---
+        _, f4b = group("三维模型（逐匝精细建模）")
+        self.in_detail = QComboBox()
+        self.in_detail.addItems(["逐匝精细模型（铜线逐匝+分层绝缘+引线）",
+                                 "简化束模型（等效整束，生成快）"])
+        self.in_leadbr = _dspin(15.0, 1, 200, 0.5)
+        self.in_leadbare = _dspin(30.0, 0, 300, 1)
+        self.in_corona = QCheckBox("绘制槽部防晕层（黑色半导电层）")
+        self.in_corona_t = _dspin(0.30, 0.01, 5, 0.05)
+        self.in_corona_ov = _dspin(50.0, 0, 500, 1)
+        f4b.addRow("导出 STEP 模型", self.in_detail)
+        f4b.addRow("引线折弯半径", self.in_leadbr)
+        f4b.addRow("引线端头裸铜长 (0=不留)", self.in_leadbare)
+        f4b.addRow(self.in_corona)
+        f4b.addRow("防晕层单边厚度", self.in_corona_t)
+        f4b.addRow("防晕层每端伸出铁芯", self.in_corona_ov)
 
         # --- 端部结构 ---
         _, f5 = group("端部结构")
@@ -255,7 +327,8 @@ class MainWindow(QMainWindow):
         lv.addLayout(btn_bar)
 
         note = QLabel(
-            "三维模型为 STEP (AP214) 实体：铜导体束 + 逐层绝缘。\n"
+            "三维模型为 STEP (AP214) 实体，部件中文名以标准 Unicode 转义写入。\n"
+            "逐匝精细模型生成约需 15~60 秒；简化束模型数秒。\n"
             "Parasolid(.x_t) 为西门子私有格式：请在 SolidWorks / NX / Solid Edge 中打开\n"
             "STEP 后另存为 .x_t（这些软件即 Parasolid 内核，转换零损失）。")
         note.setStyleSheet("color:#666; font-size:11px; padding:2px 6px;")
@@ -288,42 +361,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪 — 修改参数后点击“计算”或按 F5")
 
     # ------------------------------------------------------------------
-    def _add_layer_row(self, name: str | bool = False, t: float = 0.5) -> None:
-        row = self.layer_table.rowCount()
-        self.layer_table.insertRow(row)
-        label = name if isinstance(name, str) else f"绝缘层 {row + 1}"
-        self.layer_table.setItem(row, 0, QTableWidgetItem(label))
-        item_t = QTableWidgetItem(f"{t:g}")
-        item_t.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.layer_table.setItem(row, 1, item_t)
-        self._update_layer_sum()
-
-    def _del_layer_row(self) -> None:
-        rows = sorted({i.row() for i in self.layer_table.selectedItems()}, reverse=True)
-        if not rows and self.layer_table.rowCount():
-            rows = [self.layer_table.rowCount() - 1]
-        for r in rows:
-            self.layer_table.removeRow(r)
-        self._update_layer_sum()
-
-    def _layers(self) -> list[InsulationLayer]:
-        out = []
-        for r in range(self.layer_table.rowCount()):
-            name_item = self.layer_table.item(r, 0)
-            t_item = self.layer_table.item(r, 1)
-            name = name_item.text().strip() if name_item else f"绝缘层 {r + 1}"
-            try:
-                t = float(t_item.text()) if t_item else 0.0
-            except ValueError:
-                t = 0.0
-            out.append(InsulationLayer(name or f"绝缘层 {r + 1}", t))
-        return out
-
-    def _update_layer_sum(self) -> None:
-        s = sum(l.thickness for l in self._layers())
-        self.lbl_layer_sum.setText(f"分层总厚：{s:.2f} mm（应≈对地绝缘 T2）")
-
-    # ------------------------------------------------------------------
     def gather_input(self) -> CoilInput:
         return CoilInput(
             d2=self.in_d2.value(), lc=self.in_lc.value(),
@@ -343,7 +380,14 @@ class MainWindow(QMainWindow):
             rd1_conn=self.in_rd1.value(), rd2_nonconn=self.in_rd2.value(),
             r_bend_slot=self.in_rbs.value(), r_bend_nose=self.in_rbn.value(),
             ba=self.in_ba.value(), ysc=self.in_ysc.value(), xi=self.in_xi.value(),
-            layers=self._layers(),
+            layers=self.grp_ground.layers(),
+            turn_layers=self.grp_turn.layers(),
+            lead_bend_r=self.in_leadbr.value(),
+            lead_bare=self.in_leadbare.value(),
+            corona_on=self.in_corona.isChecked(),
+            corona_t=self.in_corona_t.value(),
+            corona_overhang=self.in_corona_ov.value(),
+            detail_3d=self.in_detail.currentIndex() == 0,
         )
 
     def apply_input(self, inp: CoilInput) -> None:
@@ -367,9 +411,14 @@ class MainWindow(QMainWindow):
         self.in_rd1.setValue(inp.rd1_conn); self.in_rd2.setValue(inp.rd2_nonconn)
         self.in_rbs.setValue(inp.r_bend_slot); self.in_rbn.setValue(inp.r_bend_nose)
         self.in_ba.setValue(inp.ba); self.in_ysc.setValue(inp.ysc); self.in_xi.setValue(inp.xi)
-        self.layer_table.setRowCount(0)
-        for layer in inp.layers:
-            self._add_layer_row(layer.name, layer.thickness)
+        self.grp_ground.set_layers(inp.layers)
+        self.grp_turn.set_layers(inp.turn_layers)
+        self.in_detail.setCurrentIndex(0 if inp.detail_3d else 1)
+        self.in_leadbr.setValue(inp.lead_bend_r)
+        self.in_leadbare.setValue(inp.lead_bare)
+        self.in_corona.setChecked(inp.corona_on)
+        self.in_corona_t.setValue(inp.corona_t)
+        self.in_corona_ov.setValue(inp.corona_overhang)
 
     # ------------------------------------------------------------------
     def recalculate(self) -> None:
@@ -460,11 +509,12 @@ class MainWindow(QMainWindow):
         if res is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出大样图", "coil_drawing.png", "PNG 图片 (*.png)")
+            self, "导出大样图", "coil_drawing.png",
+            "PNG 图片 (*.png);;PDF 矢量图 (*.pdf);;SVG 矢量图 (*.svg)")
         if not path:
             return
         try:
-            save_png(res, path)
+            save_figure(res, path)
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", str(exc))
             return
@@ -483,7 +533,10 @@ class MainWindow(QMainWindow):
             return
         self.btn_step.setEnabled(False)
         self.btn_step.setText("正在生成 3D…")
-        self.statusBar().showMessage("正在生成三维模型（首次运行需加载几何内核，约 10~30 秒）…")
+        mode = "逐匝精细" if res.inp.detail_3d else "简化束"
+        self.statusBar().showMessage(
+            f"正在生成三维模型（{mode}，首次运行需加载几何内核；"
+            "逐匝模型约 15~60 秒）…")
         self._worker = StepExportWorker(res, path, self)
         self._worker.done.connect(self._on_step_done)
         self._worker.failed.connect(self._on_step_failed)
@@ -526,6 +579,9 @@ class MainWindow(QMainWindow):
             data["wire1"] = WireSpec(**data.get("wire1", {}))
             data["wire2"] = WireSpec(**data.get("wire2", {}))
             data["layers"] = [InsulationLayer(**d) for d in data.get("layers", [])]
+            data["turn_layers"] = [InsulationLayer(**d)
+                                   for d in data.get("turn_layers", [])] or \
+                CoilInput().turn_layers
             self.apply_input(CoilInput(**data))
         except Exception:
             pass  # 配置损坏则用默认值

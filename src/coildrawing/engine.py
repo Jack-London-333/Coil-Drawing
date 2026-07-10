@@ -113,6 +113,18 @@ class CoilInput:
         InsulationLayer("对地云母带 2", 0.55),
     ])
 
+    # --- 三维逐匝精细建模 ---
+    # 匝绝缘分层（包在每匝导线束外，由内到外，单边厚度，总和应≈T1）
+    turn_layers: list[InsulationLayer] = field(default_factory=lambda: [
+        InsulationLayer("匝间云母带", 0.15),
+    ])
+    lead_bend_r: float = 15.0     # 引线折弯半径 mm（引线伸出长度用 ysc）
+    lead_bare: float = 30.0       # 引线端头裸铜长度 mm（0=不留）
+    corona_on: bool = False       # 是否绘制槽部防晕层
+    corona_t: float = 0.30        # 防晕层单边厚度 mm
+    corona_overhang: float = 50.0  # 防晕层每端伸出铁芯长度 mm
+    detail_3d: bool = True        # 导出 STEP 时使用逐匝精细模型
+
 
 @dataclass
 class CoilResult:
@@ -444,7 +456,54 @@ def compute(inp: CoilInput, aa_override: tuple[float, float] | None = None) -> C
             f"三维绝缘分层总厚 {layer_sum:.2f}mm 与槽内对地绝缘 T2={inp.t2:.2f}mm 不一致，"
             "三维模型外形将与计算截面不符（如刻意为之可忽略）")
 
+    turn_sum = sum(l.thickness for l in inp.turn_layers if l.thickness > 0)
+    if inp.turn_layers and abs(turn_sum - inp.t1) > 0.051:
+        res.warnings.append(
+            f"匝绝缘分层总厚 {turn_sum:.2f}mm 与槽内匝间绝缘 T1={inp.t1:.2f}mm 不一致，"
+            "逐匝三维模型匝廓将与计算截面不符（如刻意为之可忽略）")
+    if inp.corona_on:
+        if abs(inp.corona_t - inp.cs) > 0.051:
+            res.warnings.append(
+                f"防晕层绘制厚度 {inp.corona_t:.2f}mm 与计算用槽内防晕层 CS={inp.cs:.2f}mm "
+                "不一致，三维模型槽内外形将与计算截面不符（如刻意为之可忽略）")
+        if inp.corona_overhang > inp.ld + inp.le:
+            res.warnings.append(
+                f"防晕层每端伸出 {inp.corona_overhang:.1f}mm 超过直线段伸出铁芯长度 "
+                f"LD+LE={inp.ld + inp.le:.1f}mm，三维模型中将截短到直线段范围内")
+
     return res
+
+
+def strand_grid(inp: CoilInput):
+    """每匝内的股线排布（纯几何，供 2D 截面图与 3D 建模共用）。
+
+    返回 (w_env, h_env, strands)。w_env/h_env 为一匝裸组（含股自身绝缘）
+    的包络宽/高；strands 为字典列表：no/row/col/b/h/t0/bi/hi/x/y，
+    x 沿槽宽（周向）、y 沿槽深（径向，向外为正），均相对匝中心。
+    行序由内径侧到外径侧：导线1 各层在下，导线2 各层在上；
+    较窄的行在宽度方向居中。
+    """
+    rows: list[tuple[int, WireSpec]] = []
+    for no, w in ((1, inp.wire1), (2, inp.wire2)):
+        if w.npd > 0 and w.ncd > 0 and w.b > 0 and w.h > 0:
+            rows += [(no, w)] * w.ncd
+    if not rows:
+        raise ValueError("无有效线规（导线1/导线2 均为空），无法逐匝建模")
+    h_env = sum(w.hi for _, w in rows)
+    w_env = max(w.bi * w.npd for _, w in rows)
+    strands = []
+    y = -h_env / 2
+    row_counter: dict[int, int] = {}
+    for no, w in rows:
+        i = row_counter.get(no, 0)
+        row_counter[no] = i + 1
+        yc = y + w.hi / 2
+        for col in range(w.npd):
+            xc = (col - (w.npd - 1) / 2) * w.bi
+            strands.append(dict(no=no, row=i, col=col, b=w.b, h=w.h,
+                                t0=w.t0, bi=w.bi, hi=w.hi, x=xc, y=yc))
+        y += w.hi
+    return w_env, h_env, strands
 
 
 def patent_example_input() -> CoilInput:
