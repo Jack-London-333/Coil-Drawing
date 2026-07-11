@@ -12,11 +12,12 @@ uv sync
 Write-Host "== 2/3 PyInstaller 打包 ==" -ForegroundColor Cyan
 uv run pyinstaller CoilDrawing.spec --noconfirm --clean
 
-Write-Host "== 3/3 附带说明文档 ==" -ForegroundColor Cyan
+Write-Host "== 3/3 附带说明文档与配置模板 ==" -ForegroundColor Cyan
 Copy-Item README.md dist\CoilDrawing\README.md -Force
 New-Item -ItemType Directory -Force -Path dist\CoilDrawing\docs\images | Out-Null
 Copy-Item docs\使用教程.md dist\CoilDrawing\docs\ -Force
 Copy-Item docs\images\* dist\CoilDrawing\docs\images\ -Force
+Copy-Item docs\config_template.txt dist\CoilDrawing\config_template.txt -Force
 
 $size = [math]::Round((Get-ChildItem dist\CoilDrawing -Recurse -File | Measure-Object -Sum Length).Sum / 1MB)
 Write-Host "完成：dist\CoilDrawing（约 $size MB）— 双击 CoilDrawing.exe 使用" -ForegroundColor Green

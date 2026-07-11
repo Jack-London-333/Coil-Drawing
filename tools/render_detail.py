@@ -22,6 +22,7 @@ variant = sys.argv[1] if len(sys.argv) > 1 else "base"
 
 inp = CoilInput()
 inp.corona_on = True
+inp.cs = 0.3            # 防晕层厚度=CS
 if variant == "multi":
     inp.wire1 = WireSpec(b=4.0, h=1.6, t0=0.1, npd=2, ncd=2)
     inp.n_turns = 4

@@ -30,6 +30,9 @@ def run_smoke(out_dir: str) -> int:
     from coildrawing.engine import CoilInput, compute
     from coildrawing.ui import MainWindow
 
+    # 自检模式下工作空间落在输出目录内，避免弹出选择对话框
+    os.environ.setdefault("COILDRAWING_WORKSPACE", str(out / "workspace"))
+
     app = QApplication.instance() or QApplication(sys.argv)
     win = MainWindow()          # 构建全部界面并完成一次默认计算
     win.grab().save(str(out / "smoke_ui.png"))

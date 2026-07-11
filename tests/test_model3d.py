@@ -15,6 +15,8 @@ def small_res():
     inp = CoilInput()
     inp.n_turns = 2
     inp.corona_on = True
+    inp.cs = 0.3            # 防晕层厚度=CS（参数已合并）
+    inp.draw_wihm = True    # 层间垫片
     return compute(inp)
 
 
@@ -27,6 +29,7 @@ def test_detailed_parts_geometry(small_res):
     assert any(n.startswith("匝绝缘1") for n in names)
     assert sum(1 for n in names if n.startswith("对地绝缘")) == 2
     assert sum(1 for n in names if n.startswith("防晕层")) == 2
+    assert sum(1 for n in names if n.startswith("层间垫片")) == 2
 
     for p in parts:
         assert p.solid.volume > 0, p.name
@@ -38,6 +41,18 @@ def test_detailed_parts_geometry(small_res):
     approx_len = 2 * small_res.llm + 2 * small_res.inp.ysc
     vol_expect = w.b * w.h * approx_len
     assert abs(copper.volume - vol_expect) / vol_expect < 0.05
+
+
+def test_detailed_parts_valid_solids(small_res):
+    """全部部件必须是有效实体——无效实体在 SolidWorks 中会被降级为
+    “曲面实体”（v202607110207 问题二的根源，出线端自相交所致）。"""
+    from OCP.BRepCheck import BRepCheck_Analyzer
+
+    from coildrawing.model3d import build_coil_parts
+
+    for p in build_coil_parts(small_res, detailed=True):
+        assert BRepCheck_Analyzer(p.solid.wrapped).IsValid(), \
+            f"{p.name} 不是有效实体"
 
 
 def test_detailed_no_interference(small_res):

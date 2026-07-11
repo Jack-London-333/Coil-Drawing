@@ -16,9 +16,12 @@
 * 简化束模型：铜导体等效整束（WC×HC）+ 对地绝缘逐层壳（+ 防晕层）。
 * 逐匝精细模型：连续扁铜线（可并绕多股/双线规）绕 N 匝，匝间换位
   爬升位于接线侧鼻端平直段；每股外包自身绝缘，每匝外包“匝绝缘
-  分层”，整束外包对地绝缘方壳（引线穿出处开孔）；两端引线沿轴向
-  伸出（长度=引线长 ysc，折弯半径可调），端头留可调长度裸铜；
-  可选槽部防晕层。
+  分层”，整束外包对地绝缘方壳（引线穿出处开孔）；两端引线折弯点
+  位于接线侧鼻端两侧斜边端点（引入线落在最内匝斜边起点、引出线从
+  最外匝斜边末端翘起，与平直段上的爬升坡道完全错开，互不干涉），
+  竖直伸出（长度=引线长 ysc，折弯半径可调），端头留可调长度裸铜；
+  可选槽部防晕层（厚度=CS，可沿导线越过槽口弯角向端臂延伸）；
+  可选槽楔/槽楔下垫片/层间垫片/槽底垫片。
 
 导出为 STEP（AP214，无损 B-Rep）。Parasolid(.x_t) 为西门子私有格式，
 开源工具链无法直接生成；在 SolidWorks / NX / Solid Edge 中打开 STEP
@@ -53,6 +56,8 @@ LAYER_COLORS = [                         # 对地绝缘备选色
     (0.35, 0.60, 0.30),   # 绿
 ]
 CORONA_COLOR = (0.10, 0.10, 0.10)       # 防晕层黑
+PAD_COLOR = (0.87, 0.86, 0.80)          # 垫片灰白（层压绝缘板）
+WEDGE_COLOR = (0.58, 0.49, 0.29)        # 槽楔棕黄（环氧层压板）
 
 # 相邻匝的匝绝缘外表面名义上相切（匝距=匝高），叠放方向每边收缩此值
 # 留出工艺间隙，避免融合/显示时的共面歧义
@@ -249,6 +254,35 @@ def _radial_of(p: "b3d.Vector") -> "b3d.Vector":
     return b3d.Vector(p.X, p.Y, 0).normalized()
 
 
+def _lerp_frame(f0: _Frame, f1: _Frame, lam: float) -> _Frame:
+    """两框架间按比例 lam 插值：原点线性，姿态按轴角插值。
+
+    用于在斜边放样中途取截面框架（如防晕层延伸的自由端）。
+    """
+    o = f0.o * (1 - lam) + f1.o * lam
+    a = ((f0.x.X, f0.y.X, f0.t.X),
+         (f0.x.Y, f0.y.Y, f0.t.Y),
+         (f0.x.Z, f0.y.Z, f0.t.Z))
+    b = ((f1.x.X, f1.y.X, f1.t.X),
+         (f1.x.Y, f1.y.Y, f1.t.Y),
+         (f1.x.Z, f1.y.Z, f1.t.Z))
+    # R = B·Aᵀ，把 f0 姿态映到 f1 姿态
+    r = [[sum(b[i][k] * a[j][k] for k in range(3)) for j in range(3)]
+         for i in range(3)]
+    tr = r[0][0] + r[1][1] + r[2][2]
+    c = max(-1.0, min(1.0, (tr - 1.0) / 2.0))
+    ang = math.acos(c)
+    if ang < 1e-9:
+        return _Frame(o, f0.x, f0.y, f0.t)
+    s = 2.0 * math.sin(ang)
+    axis = b3d.Vector((r[2][1] - r[1][2]) / s,
+                      (r[0][2] - r[2][0]) / s,
+                      (r[1][0] - r[0][1]) / s).normalized()
+    da = ang * lam
+    return _Frame(o, _rotv(f0.x, axis, da), _rotv(f0.y, axis, da),
+                  _rotv(f0.t, axis, da))
+
+
 @dataclass
 class _LoopFrames:
     """束中心闭合环路的全部分段框架（匝与方壳共用）。"""
@@ -312,18 +346,23 @@ def _loop_segments(res: CoilResult) -> list:
 
 
 def _wire_segments(res: CoilResult):
-    """N 匝连续导线的分段序列（含换位爬升与两端轴向引线）。
+    """N 匝连续导线的分段序列（含换位爬升与两端竖直引线）。
 
     所有匝复用 _loop_frames 的束中心分段框架，仅按匝号作截面径向
     偏移 dy —— 弯角处各匝绕同一轴线旋转、斜边共用同一对端面框架，
     从构造上保证匝与匝、匝与方壳精确嵌套。
 
-    引线布置在接线侧鼻端平直段上（真实线圈出头位置）：
-      * 引入线在靠角3端、第 1 匝（最内层）：竖直(-Z)下来折弯后沿
-        平直段短暂前行即进角3；换位爬升在该端处于上一层，径向让开；
-      * 引出线在靠角2端、第 N 匝（最外层）：过角2后沿平直段短暂
-        前行即折弯转竖直(+Z)伸出；其余匝在该端径向让开；
-      * 两引线轴向平行伸出，径向相隔 (N-1) 匝高。
+    接线侧鼻端平直段只承载 N-1 条换位爬升坡道（相邻坡道整整错开
+    一个匝距，互不接触）；两端引线的折弯点位于平直段两侧的斜边
+    端点上，与坡道完全错开，从构造上杜绝出线端头的导线重叠：
+
+      * 引入线在第 1 匝（最内层）斜边 3→4 的起点：竖直(-Z)下来，
+        折弯后正切切入斜边方向（折弯取代该匝的角3圆角；dy(0)
+        高度上该区域没有其他导线经过）；
+      * 引出线在第 N 匝（最外层）斜边 1→2 的末端：沿斜边走完后
+        折弯转竖直(+Z)伸出（折弯取代该匝的角2圆角）；
+      * 两引线均沿轴向伸出，分居鼻端平直段两侧，一内一外，
+        与实物线圈的出头位置一致。
 
     返回 (segs, info)。info 含 tip_in/tip_out/bare_len/lead_in/lead_out。
     """
@@ -340,33 +379,37 @@ def _wire_segments(res: CoilResult):
 
     rb0 = max(inp.lead_bend_r, 2.0)
     lead_len = max(inp.ysc, 1.5 * rb0)
-    flat_len = (fl[3].ts - fl[2].te).length
-    stub = min(1.15 * rb0, 0.45 * flat_len)  # 折弯圆角在平直段内的落脚长度
 
-    segs: list = []
-
-    # ---- 引入线：竖直(-Z) → 折弯 → 平直段(第1匝) → 角3 ----
-    d0 = dy(0)
-    q_in = fl[3].ts - ffc.t * stub                    # 束中心线上的折弯角点
-    p_q_in = q_in + ffc.y * d0                        # 第1匝上的折弯角点
-    tip_in = p_q_in + zhat * lead_len
-    fin = _fillet_corner(tip_in, p_q_in, fl[3].ts + ffc.y * d0, rb0)
-    straight_in = (tip_in - fin.ts).length
-    bare = max(0.0, min(inp.lead_bare, straight_in - 1.0))
-    f_after_in = _Frame(fin.te, ffc.x, ffc.y, ffc.t)  # 折弯出口=平直段姿态
-    f_lead_in = _pre_corner(f_after_in, fin)          # 竖直段姿态（t=-Z）
-    segs.append(_Prism(f_lead_in.at(tip_in), straight_in, bare0=bare))
-    segs.append(_Rev(f_lead_in.at(fin.ts), fin))
-    segs.append(_Prism(ffc.at(fin.te - ffc.y * d0),
-                       (fl[3].ts - (fin.te - ffc.y * d0)).length, dy=d0))
-    segs.append(_Rev(ffc.at(fl[3].ts), fl[3], dy=d0))
-
-    tip_out = None
-    info_out = None
     f34s, f34e = lf.slant_frames[(3, 4)]
     f56s, f56e = lf.slant_frames[(5, 6)]
     f70s, f70e = lf.slant_frames[(7, 0)]
     f12s, f12e = lf.slant_frames[(1, 2)]
+
+    def clamp_cos(c: float) -> float:
+        return max(-1.0, min(1.0, c))
+
+    segs: list = []
+
+    # ---- 引入线：竖直(-Z) → 折弯 → 斜边 3→4 起点（第 1 匝）----
+    d0 = dy(0)
+    t34 = f34s.t
+    start_in = f34s.o + f34s.y * d0               # 第1匝斜边起点（截面中心）
+    tau_in = math.acos(clamp_cos((-zhat).dot(t34)))
+    t_tan_in = rb0 * math.tan(tau_in / 2)
+    p_corner_in = start_in - t34 * t_tan_in       # 竖直线与斜边线的交点
+    tip_in = p_corner_in + zhat * (t_tan_in + lead_len)
+    fin = _fillet_corner(tip_in, p_corner_in,
+                         start_in + t34 * max(2.5 * t_tan_in, 10.0), rb0)
+    straight_in = (tip_in - fin.ts).length
+    bare = max(0.0, min(inp.lead_bare, straight_in - 1.0))
+    f_after_in = _Frame(fin.te, f34s.x, f34s.y, f34s.t)  # 折弯出口=斜边姿态
+    f_lead_in = _pre_corner(f_after_in, fin)             # 竖直段姿态（t=-Z）
+    segs.append(_Prism(f_lead_in.at(tip_in), straight_in, bare0=bare))
+    if fin.tau > 1e-6:
+        segs.append(_Rev(f_lead_in.at(fin.ts), fin))
+
+    tip_out = None
+    info_out = None
     for k in range(n):
         d = dy(k)
         # 斜边 3→4 + 角4
@@ -390,25 +433,29 @@ def _wire_segments(res: CoilResult):
         segs.append(_Prism(lf.f_leg1.at(fl[0].te),
                            (fl[1].ts - fl[0].te).length, dy=d))
         segs.append(_Rev(lf.f_leg1.at(fl[1].ts), fl[1], dy=d))
-        # 斜边 1→2 + 角2
+        # 斜边 1→2（角2 视去向：爬升走圆角，出线走折弯）
         segs.append(_Loft(f12s, f12e, dy0=d, dy1=d))
-        segs.append(_Rev(f12e, fl[2], dy=d))
 
         if k < n - 1:
-            # 换位爬升：平直段 dy_k → dy_{k+1}，接角3
+            # 角2 + 换位爬升（平直段 dy_k → dy_{k+1}）+ 角3
+            segs.append(_Rev(f12e, fl[2], dy=d))
             segs.append(_Loft(ffc.at(fl[2].te), ffc.at(fl[3].ts),
                               dy0=d, dy1=dy(k + 1)))
             segs.append(_Rev(ffc.at(fl[3].ts), fl[3], dy=dy(k + 1)))
         else:
-            # 引出线：平直段短行 → 折弯 → 竖直(+Z)
-            q_out = fl[2].te + ffc.t * stub
-            p_q_out = q_out + ffc.y * d
-            tip_out = p_q_out + zhat * lead_len
-            fout = _fillet_corner(fl[2].te + ffc.y * d, p_q_out, tip_out, rb0)
-            segs.append(_Prism(ffc.at(fl[2].te),
-                               (fout.ts - (fl[2].te + ffc.y * d)).length, dy=d))
-            segs.append(_Rev(ffc.at(fout.ts - ffc.y * d), fout, dy=d))
-            f_here = _Frame(fout.ts, ffc.x, ffc.y, ffc.t)
+            # ---- 引出线：斜边 1→2 末端 → 折弯 → 竖直(+Z) ----
+            t12 = f12e.t
+            end_out = f12e.o + f12e.y * d          # 第 N 匝斜边末端
+            tau_out = math.acos(clamp_cos(t12.dot(zhat)))
+            t_tan_out = rb0 * math.tan(tau_out / 2)
+            p_corner_out = end_out + t12 * t_tan_out
+            tip_out = p_corner_out + zhat * (t_tan_out + lead_len)
+            fout = _fillet_corner(
+                end_out - t12 * max(2.5 * t_tan_out, 10.0),
+                p_corner_out, tip_out, rb0)
+            if fout.tau > 1e-6:
+                segs.append(_Rev(f12e, fout, dy=d))
+            f_here = _Frame(fout.ts, f12e.x, f12e.y, f12e.t)
             f_lead_out = _transport(f_here, fout)
             straight_out = (tip_out - fout.te).length
             segs.append(_Prism(f_lead_out, straight_out,
@@ -534,30 +581,120 @@ def _strand_grid(res: CoilResult):
     return strand_grid(res.inp)
 
 
-def _corona_parts(res: CoilResult, inner_w: float, inner_h: float) -> list[CoilPart]:
-    """槽部防晕层：上下层直线边各一段矩形套管（棱柱环，无布尔）。
+_CORONA_SLANT_CAP = 0.85   # 防晕层沿斜边最多延伸至斜边长度的该比例
 
-    长度不超过直线边的真实平直范围（槽口弯角圆弧起点以内），
-    否则会包到弯角上与导体/方壳干涉。
+
+def _corona_parts(res: CoilResult, inner_w: float, inner_h: float) -> list[CoilPart]:
+    """槽部防晕层（黑色半导电层，厚度=CS）：上下层直线边各一段套管。
+
+    每端伸出长度 corona_overhang 沿导线路径计量：先占直线段，超出
+    部分越过槽口弯角（部分/整段旋转环），再沿端部斜边向鼻端延伸
+    （直纹放样环，自由端截面按插值框架截取），最多至斜边长度的
+    85%——这正是实物线圈低阻防晕层弯向鼻端搭接的形态。
     """
     inp = res.inp
-    if not inp.corona_on or inp.corona_t <= 0:
+    t_cor = inp.cs
+    if not inp.corona_on or t_cor <= 0:
         return []
-    _, fl = _loop_fillets(res, 0.0)
-    z_straight = abs(fl[1].ts.Z)             # 直线边平直段半长
-    length = min(inp.lc + 2 * inp.corona_overhang, 2 * z_straight - 0.5)
+    lf = _loop_frames(res)
+    fl = lf.fl
+    w2, h2 = inner_w + 2 * t_cor, inner_h + 2 * t_cor
+    ov = max(0.0, inp.corona_overhang)
+
+    def rev_frame(f: _Frame, o: "b3d.Vector") -> _Frame:
+        """行进方向取反的框架（y 保持，x 相应翻转）。"""
+        return _Frame(o, f.y.cross(f.t * -1.0), f.y, f.t * -1.0)
+
+    def ext_pieces(f_enter: _Frame, fillet: _Fillet, f_sl0: _Frame | None,
+                   f_sl1: _Frame | None, remain: float) -> list:
+        """一端的延伸段：弯角（部分/整段）+ 斜边（部分）。"""
+        out = []
+        if remain <= 1e-9:
+            return out
+        arc_r = (fillet.ts - fillet.c).length
+        arc_len = max(arc_r * fillet.tau, 1e-9)
+        lam = min(1.0, remain / arc_len)
+        fl_part = _Fillet(fillet.ts, fillet.ma, fillet.te, fillet.c,
+                          fillet.n, fillet.tau * lam)
+        seg = _Rev(f_enter, fl_part)
+        ring = _seg_ring(seg, inner_w, inner_h, w2, h2)
+        if ring is not None:
+            out.append(ring)
+        remain -= arc_len
+        if remain <= 1e-9 or f_sl0 is None or f_sl1 is None:
+            return out
+        slant_len = (f_sl1.o - f_sl0.o).length
+        lam2 = min(remain / max(slant_len, 1e-9), _CORONA_SLANT_CAP)
+        if lam2 > 1e-6:
+            seg = _Loft(f_sl0, _lerp_frame(f_sl0, f_sl1, lam2))
+            ring = _seg_ring(seg, inner_w, inner_h, w2, h2)
+            if ring is not None:
+                out.append(ring)
+        return out
+
     parts = []
+    for tag, f_leg, i_ent, i_exi, key_bw, key_fw in (
+            ("上层边", lf.f_leg1, 0, 1, (7, 0), (1, 2)),
+            ("下层边", lf.f_leg2, 4, 5, (3, 4), (5, 6))):
+        leg_a, leg_b = fl[i_ent].te, fl[i_exi].ts
+        leg_len = (leg_b - leg_a).length
+        margin = max(0.0, (leg_len - inp.lc) / 2)   # 每端弯角前的直线余量
+
+        # 直线段套管（铁芯段 + 两端直线内的伸出）
+        take = min(ov, margin)
+        s0 = margin - take
+        length = inp.lc + 2 * take
+        seg = _Prism(f_leg.at(leg_a + f_leg.t * s0), length)
+        pieces = [_seg_ring(seg, inner_w, inner_h, w2, h2)]
+
+        remain = ov - margin
+        if remain > 1e-9:
+            # 出口端（沿环路正向：leg → 角 i_exi → 斜边 key_fw）
+            fs, fe = lf.slant_frames[key_fw]
+            pieces += ext_pieces(f_leg.at(fl[i_exi].ts), fl[i_exi],
+                                 fs, fe, remain)
+            # 入口端（逆行：leg → 角 i_ent 反向 → 斜边 key_bw 反向）
+            fil = fl[i_ent]
+            fil_rev = _Fillet(fil.te, fil.ma, fil.ts, fil.c,
+                              fil.n * -1.0, fil.tau)
+            bs, be = lf.slant_frames[key_bw]
+            pieces += ext_pieces(rev_frame(f_leg, fil.te), fil_rev,
+                                 rev_frame(be, be.o), rev_frame(bs, bs.o),
+                                 remain)
+        parts.append(CoilPart(f"防晕层-{tag}", _join(pieces), CORONA_COLOR))
+    return parts
+
+
+def _slot_hardware_parts(res: CoilResult) -> list[CoilPart]:
+    """槽内固定件：槽楔 / 槽楔下垫片 / 层间垫片 / 槽底垫片（可选）。
+
+    径向位置按专利截面堆叠链（HH1/HH2）精确计算；宽度取槽宽 WS、
+    长度取铁芯长 LC，在线圈上、下层边所在的两个槽内各生成一件。
+    """
+    inp = res.inp
+    r_bore = inp.d2 / 2
+    g1 = inp.t1 + inp.t2 + inp.cs        # 铜排外缘到绝缘线圈外缘（单边）
+    items = []                           # (开关, 名称, 内半径, 厚度, 颜色)
+    if inp.draw_wedge and inp.hsd > 0:
+        items.append(("槽楔", r_bore, inp.hsd, WEDGE_COLOR))
+    if inp.draw_wihu and inp.wihu > 0:
+        items.append(("槽楔下垫片", r_bore + inp.hsd, inp.wihu, PAD_COLOR))
+    if inp.draw_wihm and inp.wihm > 0:
+        items.append(("层间垫片", res.rr1 + res.hc + g1, inp.wihm, PAD_COLOR))
+    if inp.draw_wihb and inp.wihb > 0:
+        items.append(("槽底垫片", res.rr2 + res.hc + g1, inp.wihb, PAD_COLOR))
+    if not items:
+        return []
+
     zhat = b3d.Vector(0, 0, 1)
-    for tag, th, rc in (("上层边", -res.fai1, res.rr1 + res.hc / 2),
-                        ("下层边", +res.fai2, res.rr2 + res.hc / 2)):
-        o = _cyl(rc, th, -length / 2)
-        f = _anchor(o, zhat, _radial_of(o))
-        ring = b3d.extrude(
-            _ring_at(f, inner_w, inner_h,
-                     inner_w + 2 * inp.corona_t, inner_h + 2 * inp.corona_t,
-                     0.0, 0.0),
-            amount=length)
-        parts.append(CoilPart(f"防晕层-{tag}", ring, CORONA_COLOR))
+    parts = []
+    for tag, th in (("上层边槽", -res.fai1), ("下层边槽", +res.fai2)):
+        for name, r_in, t, color in items:
+            rc = r_in + t / 2
+            o = _cyl(rc, th, -inp.lc / 2)
+            f = _anchor(o, zhat, _radial_of(o))
+            box = b3d.extrude(_face_at(f, inp.ws, t, 0.0, 0.0), amount=inp.lc)
+            parts.append(CoilPart(f"{name}-{tag}", box, color))
     return parts
 
 
@@ -592,7 +729,7 @@ def _ground_parts(res: CoilResult, w_in: float, h_in: float,
 
 # ----------------------------------------------------------------------
 def _build_simple_parts(res: CoilResult) -> list[CoilPart]:
-    """简化束模型：铜导体等效整束 + 逐层对地绝缘壳（+ 防晕层）。"""
+    """简化束模型：铜导体等效整束 + 逐层对地绝缘壳（+ 防晕层/固定件）。"""
     segs = _loop_segments(res)
     copper = _join([_seg_solid(s, res.wc, res.hc) for s in segs])
     parts = [CoilPart("铜导体束", copper, COPPER_COLOR)]
@@ -601,32 +738,44 @@ def _build_simple_parts(res: CoilResult) -> list[CoilPart]:
     parts += gparts
     parts += _corona_parts(res, res.wc + 2 * grow + 2 * _FAMILY_GAP,
                            res.hc + 2 * grow + 2 * _FAMILY_GAP)
+    parts += _slot_hardware_parts(res)
     return parts
 
 
 def _lead_hole_cutters(res: CoilResult, info: dict,
                        cut_w: float, cut_h: float) -> list:
-    """引线穿出方壳处的开孔切割体：沿引线真实走向（竖直段+折弯+斜边入段）。"""
+    """引线穿出方壳处的开孔切割体。
+
+    采用竖直方箱（纯平面棱柱）：覆盖引线折弯的水平摆动范围，自弯角
+    平面下方一点直通引线顶端上方。相比沿引线路径的扫掠体，方箱与
+    方壳弯角处旋转环的布尔差远为健壮（扫掠体×环面布尔在 OCCT 中
+    可能不收敛），孔形也更整洁。
+
+    径向半宽取 cut_h/2（≈匝束半高+半个族间隙）：足以让包着匝绝缘的
+    导线通过，又不切穿方壳的径向侧壁。
+    """
     zhat = b3d.Vector(0, 0, 1)
     cutters = []
     for key, tip in (("lead_in", info["tip_in"]), ("lead_out", info["tip_out"])):
-        f_lead, fl = info[key]
-        top = tip + zhat * 5.0
-        if key == "lead_in":
-            # 与导线同向：竖直向下 → 折弯 → 斜边入段
-            f_down = f_lead.at(top)
-            v_end = fl.ts
-            fl_use = fl
-        else:
-            # 导线行进为 斜边→竖直；切割体反向走：竖直向下 → 反向折弯 → 斜边
-            f_down = _anchor(top, -zhat, f_lead.y)
-            v_end = fl.te
-            fl_use = _Fillet(fl.te, fl.ma, fl.ts, fl.c, fl.n * -1.0, fl.tau)
-        segs = [_Prism(f_down, (top - v_end).length),
-                _Rev(f_down.at(v_end), fl_use)]
-        f2 = _transport(f_down.at(v_end), fl_use)
-        segs.append(_Prism(f2, cut_w * 1.2))
-        cutters.append(_join([_seg_solid(s, cut_w, cut_h) for s in segs]))
+        _f_lead, fl = info[key]
+        # 关键点：折弯两切点 + 引线顶端
+        pts = [fl.ts, fl.te, tip]
+        land = fl.te if key == "lead_in" else fl.ts   # 斜边上的落点
+        # a1: 折弯水平行进方向；a2: 水平化的径向（与 a1 正交）
+        chord = fl.te - fl.ts
+        a1 = b3d.Vector(chord.X, chord.Y, 0)
+        a1 = (a1 if a1.length > 1e-9 else b3d.Vector(1, 0, 0)).normalized()
+        r_hat = _radial_of(land)
+        a2 = (r_hat - a1 * r_hat.dot(a1)).normalized()
+        u = [p.dot(a1) for p in pts]
+        u_lo, u_hi = min(u) - (cut_w / 2 + 2.0), max(u) + (cut_w / 2 + 2.0)
+        v_c = land.dot(a2)
+        z_lo = land.Z - 2.0
+        z_hi = tip.Z + 5.0
+        origin = a1 * (u_lo + u_hi) / 2 + a2 * v_c + b3d.Vector(0, 0, z_lo)
+        face = (b3d.Plane(origin=origin, x_dir=tuple(a1), z_dir=(0, 0, 1))
+                * b3d.Rectangle(u_hi - u_lo, cut_h)).face()
+        cutters.append(b3d.extrude(face, amount=z_hi - z_lo))
     return cutters
 
 
@@ -676,15 +825,18 @@ def _build_detailed_parts(res: CoilResult) -> list[CoilPart]:
     gap = _FAMILY_GAP
     w_in = w_env + 2 * wrap_total + 2 * gap
     h_in = (n - 1) * res.had + h_env + 2 * wrap_total + 2 * gap
+    # 切割体截面须严格介于 匝束外廓 与 方壳内腔 之间：若与内腔尺寸
+    # 相同，布尔差将遭遇大面积面-面重合，OCCT 可能失败甚至卡死
     cutters = _lead_hole_cutters(res, info,
-                                 w_env + 2 * wrap_total + 2 * gap,
-                                 h_env + 2 * wrap_total + 2 * gap)
+                                 w_env + 2 * wrap_total + gap,
+                                 h_env + 2 * wrap_total + gap)
     gparts, ggrow = _ground_parts(res, w_in, h_in, cutters)
     parts += gparts
 
-    # ---- 防晕层 ----
+    # ---- 防晕层 / 槽内固定件 ----
     parts += _corona_parts(res, w_in + 2 * ggrow + 2 * gap,
                            h_in + 2 * ggrow + 2 * gap)
+    parts += _slot_hardware_parts(res)
     return parts
 
 
@@ -695,10 +847,34 @@ def build_coil_parts(res: CoilResult, detailed: bool | None = None) -> list[Coil
     return _build_detailed_parts(res) if detailed else _build_simple_parts(res)
 
 
+def _ensure_valid(part: CoilPart) -> CoilPart:
+    """导出前校验部件实体有效性；无效则尝试 ShapeFix 修复。
+
+    无效实体写入 STEP 后，SolidWorks 等在导入修复失败时会把部件
+    降级为“曲面实体”（空心壳），因此这里作为最后一道保险。
+    """
+    from OCP.BRepCheck import BRepCheck_Analyzer
+
+    shape = part.solid.wrapped
+    if BRepCheck_Analyzer(shape).IsValid():
+        return part
+    try:
+        from OCP.ShapeFix import ShapeFix_Shape
+
+        fixer = ShapeFix_Shape(shape)
+        fixer.Perform()
+        fixed = fixer.Shape()
+        if BRepCheck_Analyzer(fixed).IsValid():
+            return CoilPart(part.name, b3d.Compound(fixed), part.color)
+    except Exception:
+        pass
+    return part
+
+
 def export_step(res: CoilResult, filepath: str,
                 detailed: bool | None = None) -> list[str]:
     """构造三维模型并导出 STEP。返回部件名列表。"""
-    parts = build_coil_parts(res, detailed)
+    parts = [_ensure_valid(p) for p in build_coil_parts(res, detailed)]
     children = []
     for p in parts:
         solid = p.solid

@@ -57,13 +57,16 @@ def input_rows(inp: CoilInput) -> list[tuple[str, str, str, str]]:
     rows += [
         ("rlead", "引线折弯半径", f"{inp.lead_bend_r:g}", "mm"),
         ("Lbare", "引线端头裸铜长", f"{inp.lead_bare:g}", "mm"),
-        ("防晕", "槽部防晕层(3D)", "启用" if inp.corona_on else "关闭", ""),
+        ("防晕", "槽部防晕层(3D，厚度=CS)", "启用" if inp.corona_on else "关闭", ""),
     ]
     if inp.corona_on:
-        rows += [
-            ("Tcor", "防晕层单边厚度", f"{inp.corona_t:g}", "mm"),
-            ("Lcor+", "防晕层每端伸出铁芯", f"{inp.corona_overhang:g}", "mm"),
-        ]
+        rows.append(
+            ("Lcor+", "防晕层每端伸出铁芯(沿导线)", f"{inp.corona_overhang:g}", "mm"))
+    rows.append(("固定件", "3D 槽内固定件",
+                 "、".join(x for on, x in ((inp.draw_wedge, "槽楔"),
+                                          (inp.draw_wihu, "槽楔下垫片"),
+                                          (inp.draw_wihm, "层间垫片"),
+                                          (inp.draw_wihb, "槽底垫片")) if on) or "无", ""))
     return rows
 
 

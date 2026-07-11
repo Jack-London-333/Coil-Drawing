@@ -292,7 +292,6 @@ def draw_slot_section(ax, res: CoilResult) -> None:
         cx = 0.0
         # 防晕层
         if inp.cs > 0 or inp.corona_on:
-            t_cor = inp.cs if inp.cs > 0 else inp.corona_t
             ax.add_patch(Rectangle((cx - res.w_slot / 2, y_bot), res.w_slot,
                                    res.h_slot, fc=C_CORONA, ec="k",
                                    lw=LW_THIN, zorder=4))

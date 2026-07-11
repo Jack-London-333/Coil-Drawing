@@ -2,26 +2,32 @@
 
 左侧：参数输入（分组表单 + 绝缘分层表格）
 右侧：计算结果表 / 线圈大样图预览 两个标签页
-底部：计算、导出 Excel/CSV、导出大样图 PNG、导出 STEP(3D)
+底部：计算、导出 Excel/CSV、导出大样图、导出 STEP(3D)
+
+工作空间机制：每次任务对应一个目录（可新建/切换），目录中的
+config.txt 保存全部参数（INI 风格纯文本，可手工编辑，软件检测到
+外部修改会提示载入）；各类导出默认放入工作空间的 output 子目录。
 """
 
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import sys
 import traceback
-from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtCore import QFileSystemWatcher, QLocale, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QColor, QDoubleValidator, QFont
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGridLayout,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QStatusBar,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from .config_io import CONFIG_NAME, load_config, parse_config_text, save_config
 from .engine import CoilInput, CoilResult, InsulationLayer, WireSpec, compute
 from .export import export_csv, export_xlsx
 
@@ -33,6 +39,8 @@ from matplotlib.backends.backend_qtagg import (  # noqa: E402
     FigureCanvasQTAgg, NavigationToolbar2QT)
 
 from .drawing2d import make_figure, save_figure  # noqa: E402
+
+APP_STATE_FILE = Path.home() / ".coildrawing_app.json"   # 记住上次工作空间
 
 
 # ----------------------------------------------------------------------
@@ -57,20 +65,75 @@ class StepExportWorker(QThread):
 
 
 # ----------------------------------------------------------------------
-def _dspin(val: float, lo=0.0, hi=1e6, step=0.1, dec=3, suffix=" mm") -> QDoubleSpinBox:
-    sp = QDoubleSpinBox()
-    sp.setRange(lo, hi)
-    sp.setDecimals(dec)
-    sp.setSingleStep(step)
-    sp.setValue(val)
-    if suffix:
-        sp.setSuffix(suffix)
-    sp.setAlignment(Qt.AlignRight)
-    return sp
+def _fmt(v: float) -> str:
+    """数值 → 输入框文本（最多 15 位有效数字，无多余尾零）。"""
+    return format(float(v), ".15g")
 
 
-def _ispin(val: int, lo=0, hi=100000) -> QSpinBox:
-    sp = QSpinBox()
+class NumEdit(QLineEdit):
+    """自由文本数值输入框：支持 8 位小数与科学计数法，不响应滚轮。
+
+    （QLineEdit 本身无滚轮改值行为，从根上避免误触。）
+    """
+
+    def __init__(self, val: float, lo: float = 0.0, hi: float = 1e6,
+                 parent=None):
+        super().__init__(parent)
+        self._lo, self._hi = lo, hi
+        self._last_good = float(val)
+        v = QDoubleValidator(lo, hi, 15, self)
+        v.setNotation(QDoubleValidator.ScientificNotation)
+        v.setLocale(QLocale.c())
+        self.setValidator(v)
+        self.setAlignment(Qt.AlignRight)
+        self.setValue(val)
+        self.editingFinished.connect(self._normalize)
+
+    def value(self) -> float:
+        try:
+            x = float(self.text().replace("，", ".").replace(",", "."))
+        except ValueError:
+            return self._last_good
+        x = min(max(x, self._lo), self._hi)
+        self._last_good = x
+        return x
+
+    def setValue(self, v: float) -> None:
+        self._last_good = float(v)
+        self.setText(_fmt(v))
+
+    def _normalize(self) -> None:
+        self.setText(_fmt(self.value()))
+
+
+class IntSpin(QSpinBox):
+    """整数微调框：不响应滚轮（避免误触改值）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, e) -> None:  # noqa: N802
+        e.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    """下拉框：不响应滚轮（避免误触换项）。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def wheelEvent(self, e) -> None:  # noqa: N802
+        e.ignore()
+
+
+def _dnum(val: float, lo: float = 0.0, hi: float = 1e6) -> NumEdit:
+    return NumEdit(val, lo, hi)
+
+
+def _ispin(val: int, lo=0, hi=100000) -> IntSpin:
+    sp = IntSpin()
     sp.setRange(lo, hi)
     sp.setValue(val)
     sp.setAlignment(Qt.AlignRight)
@@ -109,7 +172,7 @@ class LayerTableGroup(QGroupBox):
         self.table.insertRow(row)
         label = name if isinstance(name, str) else f"绝缘层 {row + 1}"
         self.table.setItem(row, 0, QTableWidgetItem(label))
-        item_t = QTableWidgetItem(f"{t:g}")
+        item_t = QTableWidgetItem(_fmt(t))
         item_t.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.table.setItem(row, 1, item_t)
         self.update_sum()
@@ -142,21 +205,43 @@ class LayerTableGroup(QGroupBox):
 
     def update_sum(self) -> None:
         s = sum(l.thickness for l in self.layers())
-        self.lbl_sum.setText(f"分层总厚：{s:.2f} mm（{self._sum_hint}）")
+        self.lbl_sum.setText(f"分层总厚：{_fmt(round(s, 8))} mm（{self._sum_hint}）")
 
 
 class MainWindow(QMainWindow):
-    SETTINGS_NAME = "coildrawing_last_input.json"
-
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("CoilDrawing — 电机定子成型线圈计算与建模（CN104965948B 公式体系）")
-        self.resize(1420, 860)
+        self.resize(1420, 880)
         self._result: CoilResult | None = None
         self._worker: StepExportWorker | None = None
+        self.workspace: Path | None = None
+        self._cfg_text_written = ""       # 最近一次自己写出的配置文本
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.fileChanged.connect(self._on_config_file_changed)
+        self._build_menu()
         self._build_ui()
-        self._load_last_input()
+        self._init_workspace()
         self.recalculate()
+
+    # ------------------------------------------------------------------
+    def _build_menu(self) -> None:
+        m_file = self.menuBar().addMenu("文件(&F)")
+
+        def act(text, slot, shortcut=None):
+            a = QAction(text, self)
+            if shortcut:
+                a.setShortcut(shortcut)
+            a.triggered.connect(slot)
+            m_file.addAction(a)
+            return a
+
+        act("选择/新建工作空间(&W)…", self.on_choose_workspace)
+        act("导入配置文件(&I)…（复制为 config.txt）", self.on_import_config)
+        m_file.addSeparator()
+        act("保存配置(&S)", self.on_save_config, "Ctrl+S")
+        act("重新载入配置(&R)", self.on_reload_config, "F6")
+        m_file.addSeparator()
+        act("打开工作空间文件夹(&O)", self.on_open_workspace_dir)
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -176,18 +261,18 @@ class MainWindow(QMainWindow):
             return g, f
 
         # --- 铁芯与槽 ---
-        _, f1 = group("铁芯与槽")
-        self.in_d2 = _dspin(1180.0, 10, 20000, 1, 1)
-        self.in_lc = _dspin(1250.0, 10, 20000, 1, 1)
+        _, f1 = group("铁芯与槽（长度单位 mm）")
+        self.in_d2 = _dnum(1180.0, 10, 20000)
+        self.in_lc = _dnum(1250.0, 10, 20000)
         self.in_ns = _ispin(108, 6, 2000)
         self.in_poles = _ispin(12, 2, 200)
         self.in_taw = _ispin(9, 2, 200)
-        self.in_hs = _dspin(74.0, 1, 500, 0.5, 2)
-        self.in_ws = _dspin(11.5, 1, 100, 0.1, 2)
-        self.in_hsd = _dspin(4.0, 0, 50, 0.1, 2)
-        self.in_wihu = _dspin(1.0, 0, 20, 0.1, 2)
-        self.in_wihm = _dspin(3.0, 0, 20, 0.1, 2)
-        self.in_wihb = _dspin(1.0, 0, 20, 0.1, 2)
+        self.in_hs = _dnum(74.0, 1, 500)
+        self.in_ws = _dnum(11.5, 1, 100)
+        self.in_hsd = _dnum(4.0, 0, 50)
+        self.in_wihu = _dnum(1.0, 0, 20)
+        self.in_wihm = _dnum(3.0, 0, 20)
+        self.in_wihb = _dnum(1.0, 0, 20)
         f1.addRow("定子铁芯内径 D2", self.in_d2)
         f1.addRow("铁芯轴向长度 LC", self.in_lc)
         f1.addRow("定子槽数 NS", self.in_ns)
@@ -201,16 +286,16 @@ class MainWindow(QMainWindow):
         f1.addRow("槽底垫片 WIHB", self.in_wihb)
 
         # --- 绕组线规 ---
-        _, f2 = group("绕组与线规")
+        _, f2 = group("绕组与线规（长度单位 mm）")
         self.in_turns = _ispin(8, 1, 200)
-        self.in_w1b = _dspin(8.2, 0, 50, 0.05)
-        self.in_w1h = _dspin(3.35, 0, 50, 0.05)
-        self.in_w1t0 = _dspin(0.0, 0, 5, 0.01)
+        self.in_w1b = _dnum(8.2, 0, 50)
+        self.in_w1h = _dnum(3.35, 0, 50)
+        self.in_w1t0 = _dnum(0.0, 0, 5)
         self.in_w1npd = _ispin(1, 0, 20)
         self.in_w1ncd = _ispin(1, 0, 20)
-        self.in_w2b = _dspin(0.0, 0, 50, 0.05)
-        self.in_w2h = _dspin(0.0, 0, 50, 0.05)
-        self.in_w2t0 = _dspin(0.0, 0, 5, 0.01)
+        self.in_w2b = _dnum(0.0, 0, 50)
+        self.in_w2h = _dnum(0.0, 0, 50)
+        self.in_w2t0 = _dnum(0.0, 0, 5)
         self.in_w2npd = _ispin(0, 0, 20)
         self.in_w2ncd = _ispin(0, 0, 20)
         f2.addRow("线圈匝数 N", self.in_turns)
@@ -226,12 +311,12 @@ class MainWindow(QMainWindow):
         f2.addRow("导线2 每匝层数 NCD2", self.in_w2ncd)
 
         # --- 绝缘 ---
-        _, f3 = group("绝缘（单边厚度）")
-        self.in_t1 = _dspin(0.15, 0, 5, 0.01)
-        self.in_t3 = _dspin(0.15, 0, 5, 0.01)
-        self.in_t2 = _dspin(1.1, 0, 10, 0.05)
-        self.in_t4 = _dspin(1.1, 0, 10, 0.05)
-        self.in_cs = _dspin(0.0, 0, 5, 0.05)
+        _, f3 = group("绝缘（单边厚度，单位 mm）")
+        self.in_t1 = _dnum(0.15, 0, 5)
+        self.in_t3 = _dnum(0.15, 0, 5)
+        self.in_t2 = _dnum(1.1, 0, 10)
+        self.in_t4 = _dnum(1.1, 0, 10)
+        self.in_cs = _dnum(0.0, 0, 5)
         f3.addRow("槽内匝间绝缘 T1", self.in_t1)
         f3.addRow("端部匝间绝缘 T3", self.in_t3)
         f3.addRow("槽内对地绝缘 T2", self.in_t2)
@@ -252,39 +337,55 @@ class MainWindow(QMainWindow):
 
         # --- 三维模型选项 ---
         _, f4b = group("三维模型（逐匝精细建模）")
-        self.in_detail = QComboBox()
+        self.in_detail = NoWheelComboBox()
         self.in_detail.addItems(["逐匝精细模型（铜线逐匝+分层绝缘+引线）",
                                  "简化束模型（等效整束，生成快）"])
-        self.in_leadbr = _dspin(15.0, 1, 200, 0.5)
-        self.in_leadbare = _dspin(30.0, 0, 300, 1)
-        self.in_corona = QCheckBox("绘制槽部防晕层（黑色半导电层）")
-        self.in_corona_t = _dspin(0.30, 0.01, 5, 0.05)
-        self.in_corona_ov = _dspin(50.0, 0, 500, 1)
+        self.in_leadbr = _dnum(15.0, 1, 200)
+        self.in_leadbare = _dnum(30.0, 0, 300)
+        self.in_corona = QCheckBox("绘制槽部防晕层（黑色半导电层，厚度=CS）")
+        self.in_corona.toggled.connect(self._on_corona_toggled)
+        self.in_corona_ov = _dnum(50.0, 0, 1000)
         f4b.addRow("导出 STEP 模型", self.in_detail)
-        f4b.addRow("引线折弯半径", self.in_leadbr)
-        f4b.addRow("引线端头裸铜长 (0=不留)", self.in_leadbare)
+        f4b.addRow("引线折弯半径 (mm)", self.in_leadbr)
+        f4b.addRow("引线端头裸铜长 (mm, 0=不留)", self.in_leadbare)
         f4b.addRow(self.in_corona)
-        f4b.addRow("防晕层单边厚度", self.in_corona_t)
-        f4b.addRow("防晕层每端伸出铁芯", self.in_corona_ov)
+        f4b.addRow("防晕层每端伸出铁芯 (mm, 沿导线)", self.in_corona_ov)
+        lbl_cor = QLabel("伸出超过直线段时自动越过槽口弯角、沿端臂向鼻端延伸")
+        lbl_cor.setStyleSheet("color:#888; font-size:11px;")
+        f4b.addRow("", lbl_cor)
+
+        # 槽内固定件
+        hw = QWidget()
+        hw_grid = QGridLayout(hw)
+        hw_grid.setContentsMargins(0, 0, 0, 0)
+        self.in_draw_wedge = QCheckBox("槽楔 HSD")
+        self.in_draw_wihu = QCheckBox("槽楔下垫片 WIHU")
+        self.in_draw_wihm = QCheckBox("层间垫片 WIHM")
+        self.in_draw_wihb = QCheckBox("槽底垫片 WIHB")
+        hw_grid.addWidget(self.in_draw_wedge, 0, 0)
+        hw_grid.addWidget(self.in_draw_wihu, 0, 1)
+        hw_grid.addWidget(self.in_draw_wihm, 1, 0)
+        hw_grid.addWidget(self.in_draw_wihb, 1, 1)
+        f4b.addRow("槽内固定件加入模型", hw)
 
         # --- 端部结构 ---
-        _, f5 = group("端部结构")
-        self.in_ld = _dspin(20.0, 0, 200, 0.5)
-        self.in_le = _dspin(20.0, 0, 200, 0.5)
-        self.in_f = _dspin(20.0, 0, 200, 0.5)
-        self.in_seita3 = _dspin(0.349, 0, 1.57, 0.001, 3, " rad")
-        self.in_rd = _dspin(15.0, 1, 100, 0.5)
-        self.in_rd1 = _dspin(15.0, 0, 100, 0.5)
-        self.in_rd2 = _dspin(15.0, 0, 100, 0.5)
-        self.in_rbs = _dspin(30.0, 1, 200, 0.5)
-        self.in_rbn = _dspin(30.0, 1, 200, 0.5)
-        self.in_ba = _dspin(7.0, 0.1, 100, 0.1)
-        self.in_ysc = _dspin(45.0, 0, 500, 1)
-        self.in_xi = _dspin(0.01, 0.001, 0.02, 0.001, 3, "")
+        _, f5 = group("端部结构（长度单位 mm）")
+        self.in_ld = _dnum(20.0, 0, 200)
+        self.in_le = _dnum(20.0, 0, 200)
+        self.in_f = _dnum(20.0, 0, 200)
+        self.in_seita3 = _dnum(0.349, 0, 1.57)
+        self.in_rd = _dnum(15.0, 1, 100)
+        self.in_rd1 = _dnum(15.0, 0, 100)
+        self.in_rd2 = _dnum(15.0, 0, 100)
+        self.in_rbs = _dnum(30.0, 1, 200)
+        self.in_rbn = _dnum(30.0, 1, 200)
+        self.in_ba = _dnum(7.0, 0.1, 100)
+        self.in_ysc = _dnum(45.0, 0, 500)
+        self.in_xi = _dnum(1e-9, 1e-12, 0.02)
         f5.addRow("齿压板轴向长度 LD", self.in_ld)
         f5.addRow("直线部伸出铁芯 LE", self.in_le)
         f5.addRow("鼻端抬高 F", self.in_f)
-        f5.addRow("鼻端中心线夹角 seita3", self.in_seita3)
+        f5.addRow("鼻端中心线夹角 seita3 (rad)", self.in_seita3)
         f5.addRow("鼻端半径 RD", self.in_rd)
         f5.addRow("接线侧弯弧半径 RD1", self.in_rd1)
         f5.addRow("非接线侧弯弧半径 RD2", self.in_rd2)
@@ -299,7 +400,7 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidget(form_host)
         scroll.setWidgetResizable(True)
-        scroll.setMinimumWidth(390)
+        scroll.setMinimumWidth(400)
 
         left = QWidget()
         lv = QVBoxLayout(left)
@@ -327,11 +428,12 @@ class MainWindow(QMainWindow):
         lv.addLayout(btn_bar)
 
         note = QLabel(
-            "三维模型为 STEP (AP214) 实体，部件中文名以标准 Unicode 转义写入。\n"
-            "逐匝精细模型生成约需 15~60 秒；简化束模型数秒。\n"
-            "Parasolid(.x_t) 为西门子私有格式：请在 SolidWorks / NX / Solid Edge 中打开\n"
-            "STEP 后另存为 .x_t（这些软件即 Parasolid 内核，转换零损失）。")
+            "参数保存在工作空间 config.txt 中（可手工编辑，外部修改会提示载入）；"
+            "导出默认到工作空间 output 目录。\n"
+            "三维模型为 STEP (AP214) 实体。逐匝精细模型生成约需 15~60 秒；"
+            "需要 Parasolid(.x_t) 时用 SolidWorks / NX 打开 STEP 另存即可。")
         note.setStyleSheet("color:#666; font-size:11px; padding:2px 6px;")
+        note.setWordWrap(True)
         lv.addWidget(note)
         splitter.addWidget(left)
 
@@ -361,6 +463,14 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪 — 修改参数后点击“计算”或按 F5")
 
     # ------------------------------------------------------------------
+    def _on_corona_toggled(self, checked: bool) -> None:
+        if checked and self.in_cs.value() <= 0:
+            self.in_cs.setValue(0.30)
+            self.statusBar().showMessage(
+                "已自动将槽内防晕层 CS 设为 0.30 mm（防晕层厚度=CS，"
+                "计算与三维模型保持一致），请按 F5 重新计算")
+
+    # ------------------------------------------------------------------
     def gather_input(self) -> CoilInput:
         return CoilInput(
             d2=self.in_d2.value(), lc=self.in_lc.value(),
@@ -385,9 +495,12 @@ class MainWindow(QMainWindow):
             lead_bend_r=self.in_leadbr.value(),
             lead_bare=self.in_leadbare.value(),
             corona_on=self.in_corona.isChecked(),
-            corona_t=self.in_corona_t.value(),
             corona_overhang=self.in_corona_ov.value(),
             detail_3d=self.in_detail.currentIndex() == 0,
+            draw_wedge=self.in_draw_wedge.isChecked(),
+            draw_wihu=self.in_draw_wihu.isChecked(),
+            draw_wihm=self.in_draw_wihm.isChecked(),
+            draw_wihb=self.in_draw_wihb.isChecked(),
         )
 
     def apply_input(self, inp: CoilInput) -> None:
@@ -417,8 +530,11 @@ class MainWindow(QMainWindow):
         self.in_leadbr.setValue(inp.lead_bend_r)
         self.in_leadbare.setValue(inp.lead_bare)
         self.in_corona.setChecked(inp.corona_on)
-        self.in_corona_t.setValue(inp.corona_t)
         self.in_corona_ov.setValue(inp.corona_overhang)
+        self.in_draw_wedge.setChecked(inp.draw_wedge)
+        self.in_draw_wihu.setChecked(inp.draw_wihu)
+        self.in_draw_wihm.setChecked(inp.draw_wihm)
+        self.in_draw_wihb.setChecked(inp.draw_wihb)
 
     # ------------------------------------------------------------------
     def recalculate(self) -> None:
@@ -432,7 +548,7 @@ class MainWindow(QMainWindow):
             return
         self._fill_result_table(self._result)
         self._draw_preview(self._result)
-        self._save_last_input(inp)
+        self._write_config(inp)
         msg = (f"计算完成：平均匝长 LLM={self._result.llm:.1f} mm，"
                f"端部投影 CC={self._result.cc:.1f} mm，迭代 {self._result.iterations} 次")
         if self._result.warnings:
@@ -468,18 +584,201 @@ class MainWindow(QMainWindow):
         fig.set_canvas(self.canvas)
         self.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # 工作空间 / config.txt
+    # ==================================================================
+    def _load_app_state(self) -> dict:
+        try:
+            return json.loads(APP_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _save_app_state(self, **kw) -> None:
+        state = self._load_app_state()
+        state.update(kw)
+        try:
+            APP_STATE_FILE.write_text(
+                json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _config_path(self) -> Path | None:
+        return self.workspace / CONFIG_NAME if self.workspace else None
+
+    def _init_workspace(self) -> None:
+        """启动时确定工作空间：优先环境变量/上次的；否则询问；取消则用默认目录。"""
+        env_ws = os.environ.get("COILDRAWING_WORKSPACE")
+        if env_ws:   # 自检/脚本模式：无对话框直接使用
+            self._set_workspace(Path(env_ws))
+            return
+        last = self._load_app_state().get("last_workspace", "")
+        if last and Path(last).is_dir():
+            self._set_workspace(Path(last))
+            return
+        QMessageBox.information(
+            self, "选择工作空间",
+            "请为本次任务选择（或新建）一个工作空间目录。\n\n"
+            "目录中将生成参数配置文件 config.txt 与导出目录 output；\n"
+            "以后启动会自动打开上次的工作空间，可用菜单 文件→选择/新建工作空间 切换。")
+        path = QFileDialog.getExistingDirectory(
+            self, "选择/新建工作空间目录（对话框内可新建文件夹）")
+        if not path:
+            path = str(Path.home() / "Documents" / "CoilDrawing")
+            Path(path).mkdir(parents=True, exist_ok=True)
+            QMessageBox.information(
+                self, "使用默认工作空间", f"未选择目录，已使用默认工作空间：\n{path}")
+        self._set_workspace(Path(path))
+
+    def _set_workspace(self, ws: Path) -> None:
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "output").mkdir(exist_ok=True)
+        old_cfg = self._config_path()
+        if old_cfg is not None and str(old_cfg) in self._watcher.files():
+            self._watcher.removePath(str(old_cfg))
+        self.workspace = ws
+        cfg = self._config_path()
+        if cfg.exists():
+            try:
+                self.apply_input(load_config(cfg))
+                self._cfg_text_written = cfg.read_text(encoding="utf-8")
+            except (ValueError, OSError) as exc:
+                QMessageBox.warning(
+                    self, "配置载入失败",
+                    f"{cfg} 载入失败，界面保持当前参数：\n\n{exc}")
+        else:
+            self._write_config(self.gather_input())
+        if cfg.exists():
+            self._watcher.addPath(str(cfg))
+        self._save_app_state(last_workspace=str(ws))
+        self.setWindowTitle(
+            f"CoilDrawing — 电机定子成型线圈计算与建模（CN104965948B 公式体系）"
+            f"  [工作空间: {ws}]")
+
+    def _write_config(self, inp: CoilInput) -> None:
+        cfg = self._config_path()
+        if cfg is None:
+            return
+        try:
+            self._cfg_text_written = save_config(cfg, inp)
+        except OSError as exc:
+            self.statusBar().showMessage(f"配置写入失败：{exc}")
+            return
+        if str(cfg) not in self._watcher.files():
+            self._watcher.addPath(str(cfg))
+
+    def _on_config_file_changed(self, path: str) -> None:
+        """外部修改 config.txt → 提示载入（自己写出的不提示）。"""
+        cfg = self._config_path()
+        if cfg is None or str(cfg) != path:
+            return
+        # 某些编辑器保存是“删除+重建”，需要重新挂监听
+        if str(cfg) not in self._watcher.files() and cfg.exists():
+            self._watcher.addPath(str(cfg))
+        try:
+            text = cfg.read_text(encoding="utf-8")
+        except OSError:
+            return
+        if text == self._cfg_text_written:
+            return
+        ret = QMessageBox.question(
+            self, "配置文件已修改",
+            f"{cfg.name} 在软件外部被修改，是否载入新参数并重新计算？\n"
+            "（选择“No”保留界面当前参数，下次保存将覆盖外部修改）",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if ret != QMessageBox.Yes:
+            self._cfg_text_written = text   # 视为已知内容，避免反复弹窗
+            return
+        try:
+            self.apply_input(parse_config_text(text))
+        except ValueError as exc:
+            QMessageBox.warning(self, "配置解析失败", str(exc))
+            self._cfg_text_written = text
+            return
+        self._cfg_text_written = text
+        self.recalculate()
+
+    # ---- 菜单动作 ----
+    def on_choose_workspace(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "选择/新建工作空间目录（对话框内可新建文件夹）",
+            str(self.workspace or Path.home()))
+        if not path:
+            return
+        self._set_workspace(Path(path))
+        self.recalculate()
+        self.statusBar().showMessage(f"已切换工作空间：{path}")
+
+    def on_import_config(self) -> None:
+        if self.workspace is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入配置文件（将复制为工作空间的 config.txt）",
+            str(self.workspace), "配置文本 (*.txt);;所有文件 (*)")
+        if not path:
+            return
+        src = Path(path)
+        cfg = self._config_path()
+        try:
+            inp = load_config(src)      # 先验证再覆盖
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "导入失败", f"{src} 不是有效的配置文件：\n\n{exc}")
+            return
+        if cfg.exists() and src.resolve() != cfg.resolve():
+            ret = QMessageBox.question(
+                self, "覆盖确认",
+                f"工作空间已有 {CONFIG_NAME}，导入将覆盖它，继续吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if ret != QMessageBox.Yes:
+                return
+        if src.resolve() != cfg.resolve():
+            shutil.copyfile(src, cfg)
+        self._cfg_text_written = cfg.read_text(encoding="utf-8")
+        self.apply_input(inp)
+        self.recalculate()
+        self.statusBar().showMessage(f"已导入 {src.name} → {cfg}")
+
+    def on_save_config(self) -> None:
+        self._write_config(self.gather_input())
+        self.statusBar().showMessage(f"配置已保存：{self._config_path()}")
+
+    def on_reload_config(self) -> None:
+        cfg = self._config_path()
+        if cfg is None or not cfg.exists():
+            return
+        try:
+            inp = load_config(cfg)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "载入失败", str(exc))
+            return
+        self._cfg_text_written = cfg.read_text(encoding="utf-8")
+        self.apply_input(inp)
+        self.recalculate()
+        self.statusBar().showMessage(f"已重新载入配置：{cfg}")
+
+    def on_open_workspace_dir(self) -> None:
+        if self.workspace is not None:
+            os.startfile(str(self.workspace))  # noqa: S606
+
+    # ==================================================================
+    # 导出（默认到 工作空间/output）
+    # ==================================================================
     def _ensure_result(self) -> CoilResult | None:
         if self._result is None:
             self.recalculate()
         return self._result
+
+    def _export_dir(self) -> Path:
+        d = (self.workspace / "output") if self.workspace else Path.cwd()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     def on_export_xlsx(self) -> None:
         res = self._ensure_result()
         if res is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 Excel", "coil_result.xlsx", "Excel (*.xlsx)")
+            self, "导出 Excel", str(self._export_dir() / "coil_result.xlsx"),
+            "Excel (*.xlsx)")
         if not path:
             return
         try:
@@ -494,7 +793,8 @@ class MainWindow(QMainWindow):
         if res is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 CSV", "coil_result.csv", "CSV (*.csv)")
+            self, "导出 CSV", str(self._export_dir() / "coil_result.csv"),
+            "CSV (*.csv)")
         if not path:
             return
         try:
@@ -509,7 +809,7 @@ class MainWindow(QMainWindow):
         if res is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出大样图", "coil_drawing.png",
+            self, "导出大样图", str(self._export_dir() / "coil_drawing.png"),
             "PNG 图片 (*.png);;PDF 矢量图 (*.pdf);;SVG 矢量图 (*.svg)")
         if not path:
             return
@@ -528,7 +828,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "请稍候", "上一个 STEP 导出仍在进行中")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "导出 STEP 三维模型", "coil_3d.step", "STEP (*.step *.stp)")
+            self, "导出 STEP 三维模型", str(self._export_dir() / "coil_3d.step"),
+            "STEP (*.step *.stp)")
         if not path:
             return
         self.btn_step.setEnabled(False)
@@ -557,34 +858,6 @@ class MainWindow(QMainWindow):
         self.btn_step.setText("导出 STEP (3D)")
         self.statusBar().showMessage("STEP 导出失败")
         QMessageBox.critical(self, "STEP 导出失败", err[-2000:])
-
-    # ------------------------------------------------------------------
-    def _settings_path(self) -> Path:
-        return Path.home() / self.SETTINGS_NAME
-
-    def _save_last_input(self, inp: CoilInput) -> None:
-        try:
-            self._settings_path().write_text(
-                json.dumps(asdict(inp), ensure_ascii=False, indent=1),
-                encoding="utf-8")
-        except OSError:
-            pass
-
-    def _load_last_input(self) -> None:
-        p = self._settings_path()
-        if not p.exists():
-            return
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-            data["wire1"] = WireSpec(**data.get("wire1", {}))
-            data["wire2"] = WireSpec(**data.get("wire2", {}))
-            data["layers"] = [InsulationLayer(**d) for d in data.get("layers", [])]
-            data["turn_layers"] = [InsulationLayer(**d)
-                                   for d in data.get("turn_layers", [])] or \
-                CoilInput().turn_layers
-            self.apply_input(CoilInput(**data))
-        except Exception:
-            pass  # 配置损坏则用默认值
 
 
 def main() -> int:

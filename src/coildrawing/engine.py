@@ -28,6 +28,14 @@ import math
 from dataclasses import dataclass, field, replace
 
 
+def fmt_num(v: float, nd: int = 8) -> str:
+    """数值 → 文本：保留 nd 位小数并去尾零（至少保留 1 位整数）。"""
+    txt = f"{v:.{nd}f}"
+    if "." in txt:
+        txt = txt.rstrip("0").rstrip(".")
+    return txt if txt not in ("", "-") else "0"
+
+
 @dataclass
 class WireSpec:
     """一种线规（成型线圈用扁铜线）。
@@ -105,7 +113,7 @@ class CoilInput:
     r_bend_nose: float = 30.0  # 端部斜边与鼻端连接处弯曲半径 rd2 mm
     ba: float = 7.0          # 线圈端部间隙给定值 mm
     ysc: float = 45.0        # 引线长 mm
-    xi: float = 0.01         # 端部迭代误差设定值 ξ
+    xi: float = 1e-9         # 端部迭代误差设定值 ξ
 
     # --- 三维模型的对地绝缘分层（单边厚度，供 3D/大样使用） ---
     layers: list[InsulationLayer] = field(default_factory=lambda: [
@@ -120,10 +128,14 @@ class CoilInput:
     ])
     lead_bend_r: float = 15.0     # 引线折弯半径 mm（引线伸出长度用 ysc）
     lead_bare: float = 30.0       # 引线端头裸铜长度 mm（0=不留）
-    corona_on: bool = False       # 是否绘制槽部防晕层
-    corona_t: float = 0.30        # 防晕层单边厚度 mm
-    corona_overhang: float = 50.0  # 防晕层每端伸出铁芯长度 mm
+    corona_on: bool = False       # 是否绘制槽部防晕层（厚度=CS）
+    corona_overhang: float = 50.0  # 防晕层每端伸出铁芯长度 mm（沿导线，可越过弯角沿端臂延伸）
     detail_3d: bool = True        # 导出 STEP 时使用逐匝精细模型
+    # --- 槽内固定件（垫片/槽楔）是否加入三维模型 ---
+    draw_wedge: bool = False      # 槽楔 HSD
+    draw_wihu: bool = False       # 槽楔下垫片 WIHU
+    draw_wihm: bool = False       # 层间垫片 WIHM
+    draw_wihb: bool = False       # 槽底垫片 WIHB
 
 
 @dataclass
@@ -215,17 +227,21 @@ class CoilResult:
 
     # ------------------------------------------------------------------
     def rows(self) -> list[tuple[str, str, str, str]]:
-        """生成 (符号, 名称, 数值, 单位) 结果表，供 UI 和导出使用。"""
+        """生成 (符号, 名称, 数值, 单位) 结果表，供 UI 和导出使用。
+
+        数值显示到小数点后 8 位并去掉无意义的尾零（内部计算为
+        全精度 double，导出 Excel/CSV 时亦写出该 8 位小数文本）。
+        """
         deg = 180.0 / math.pi
         r: list[tuple[str, str, str, str]] = []
 
-        def add(sym: str, name: str, val, unit: str = "mm", nd: int = 2):
+        def add(sym: str, name: str, val, unit: str = "mm", nd: int = 8):
             if isinstance(val, bool):
                 txt = "是" if val else "否"
             elif isinstance(val, int):
                 txt = str(val)
             else:
-                txt = f"{val:.{nd}f}"
+                txt = fmt_num(val, nd)
             r.append((sym, name, txt, unit))
 
         r.append(("—", "— 步骤1 导线绝缘后尺寸 —", "", ""))
@@ -254,8 +270,8 @@ class CoilResult:
         add("hh2", "槽内上下层线圈间绝缘厚度", self.hh2)
         add("RR1", "上层边底部中点半径", self.rr1)
         add("RR2", "下层边底部中点半径", self.rr2)
-        add("fai", "上下层边间张角", self.fai, "rad", 4)
-        add("fai°", "上下层边间张角", self.fai * deg, "°", 2)
+        add("fai", "上下层边间张角", self.fai, "rad")
+        add("fai°", "上下层边间张角", self.fai * deg, "°")
         add("E1", "接线侧鼻端轴向投影长", self.e1)
         add("E2", "非接线侧鼻端轴向投影长", self.e2)
         add("t1", "上层边处齿距", self.t_pitch1)
@@ -274,10 +290,10 @@ class CoilResult:
 
         r.append(("—", "— 步骤5 端部与匝长 —", "", ""))
         add("CC", "端部轴向投影长", self.cc)
-        add("seita1", "上层边与铁芯端面夹角", self.seita1, "rad", 4)
-        add("seita1°", "上层边与铁芯端面夹角", self.seita1 * deg, "°", 2)
-        add("seita2", "下层边与铁芯端面夹角", self.seita2, "rad", 4)
-        add("seita2°", "下层边与铁芯端面夹角", self.seita2 * deg, "°", 2)
+        add("seita1", "上层边与铁芯端面夹角", self.seita1, "rad")
+        add("seita1°", "上层边与铁芯端面夹角", self.seita1 * deg, "°")
+        add("seita2", "下层边与铁芯端面夹角", self.seita2, "rad")
+        add("seita2°", "下层边与铁芯端面夹角", self.seita2 * deg, "°")
         add("Ba1", "上层边端部实际间隙", self.ba1)
         add("Ba2", "下层边端部实际间隙", self.ba2)
         add("S1", "上层端部斜边弧长", self.s1)
@@ -462,14 +478,17 @@ def compute(inp: CoilInput, aa_override: tuple[float, float] | None = None) -> C
             f"匝绝缘分层总厚 {turn_sum:.2f}mm 与槽内匝间绝缘 T1={inp.t1:.2f}mm 不一致，"
             "逐匝三维模型匝廓将与计算截面不符（如刻意为之可忽略）")
     if inp.corona_on:
-        if abs(inp.corona_t - inp.cs) > 0.051:
+        if inp.cs <= 0:
             res.warnings.append(
-                f"防晕层绘制厚度 {inp.corona_t:.2f}mm 与计算用槽内防晕层 CS={inp.cs:.2f}mm "
-                "不一致，三维模型槽内外形将与计算截面不符（如刻意为之可忽略）")
-        if inp.corona_overhang > inp.ld + inp.le:
+                "已勾选绘制防晕层但槽内防晕层 CS=0，三维模型中防晕层无厚度不会生成；"
+                "请在“绝缘”组中填入 CS（典型 0.2~0.5mm）")
+        # 防晕层沿导线延伸的可用长度 ≈ 直线段伸出 + 槽口弯角弧长 + 斜边长
+        arc1 = inp.r_bend_slot * (math.pi / 2 - res.seita1)
+        reach = inp.ld + inp.le + arc1 + 0.9 * min(res.s1, res.s2)
+        if inp.corona_overhang > reach:
             res.warnings.append(
-                f"防晕层每端伸出 {inp.corona_overhang:.1f}mm 超过直线段伸出铁芯长度 "
-                f"LD+LE={inp.ld + inp.le:.1f}mm，三维模型中将截短到直线段范围内")
+                f"防晕层每端伸出 {fmt_num(inp.corona_overhang, 1)}mm 超过沿导线可延伸长度"
+                f"（直线段+槽口弯角+斜边 ≈{fmt_num(reach, 1)}mm），三维模型中将截短")
 
     return res
 
