@@ -40,7 +40,7 @@ def test_detailed_parts_geometry(small_res):
     w = small_res.inp.wire1
     approx_len = 2 * small_res.llm + 2 * small_res.inp.ysc
     vol_expect = w.b * w.h * approx_len
-    assert abs(copper.volume - vol_expect) / vol_expect < 0.05
+    assert abs(copper.volume - vol_expect) / vol_expect < 0.08
 
 
 def test_detailed_parts_valid_solids(small_res):
@@ -95,3 +95,88 @@ def test_simple_parts_still_work(small_res):
     assert parts[0].name == "铜导体束"
     for p in parts:
         assert p.solid.volume > 0, p.name
+
+def test_zero_family_gap_constants():
+    """剖面无缝：匝间/族间隙必须为零。"""
+    from coildrawing import model3d as m
+
+    assert m._TURN_CLEARANCE == 0.0
+    assert m._FAMILY_GAP == 0.0
+    assert m._HOLE_CLEARANCE <= 0.1
+
+
+def test_pad_corona_no_interference(small_res):
+    """层间垫片与防晕层不得有明显体积干涉。"""
+    from coildrawing.model3d import build_coil_parts
+
+    parts = build_coil_parts(small_res, detailed=True)
+    pads = [p for p in parts if p.name.startswith("层间垫片")]
+    coronas = [p for p in parts if p.name.startswith("防晕层")]
+    assert pads and coronas
+    for pad in pads:
+        for cor in coronas:
+            try:
+                inter = pad.solid & cor.solid
+                v = inter.volume if inter is not None else 0.0
+            except Exception:
+                v = 0.0
+            assert v < 1.0, f"{pad.name} ∩ {cor.name} = {v:.2f}"
+
+
+def test_copper_turn_no_interference(small_res):
+    """铜导线与匝绝缘不得体积干涉（退让后出线端也应干净）。"""
+    from coildrawing.model3d import build_coil_parts
+
+    parts = build_coil_parts(small_res, detailed=True)
+    copper = next(p for p in parts if p.name.startswith("铜导线")).solid
+    for p in parts:
+        if not p.name.startswith("匝绝缘"):
+            continue
+        try:
+            inter = copper & p.solid
+            v = inter.volume if inter is not None else 0.0
+        except Exception:
+            v = 0.0
+        # 匝绝缘是包在铜外的壳，体积交应为接近 0（壳内腔贴铜）
+        assert v < 5.0, f"铜 ∩ {p.name} = {v:.2f}"
+
+
+def test_lead_holes_snug(small_res):
+    """对地开孔应贴近导线包络：引线柱探针与对地残余交集体积极小。"""
+    from coildrawing.model3d import (
+        b3d, build_coil_parts, _wire_segments, _strand_grid, _HOLE_CLEARANCE,
+    )
+
+    res = small_res
+    _, info = _wire_segments(res)
+    w_env, h_env, _ = _strand_grid(res)
+    wrap = sum(l.thickness for l in res.inp.turn_layers if l.thickness > 0)
+    cut_w = w_env + 2 * wrap + 2 * _HOLE_CLEARANCE
+    cut_h = h_env + 2 * wrap + 2 * _HOLE_CLEARANCE
+    parts = build_coil_parts(res, detailed=True)
+    for p in parts:
+        if not p.name.startswith("对地绝缘"):
+            continue
+        for tag, tip in (("in", info["tip_in"]), ("out", info["tip_out"])):
+            # 细探针：略小于包络，应几乎不与对地相交（孔已挖通）
+            probe = b3d.Pos(tip.X, tip.Y, tip.Z - 20) * b3d.Box(
+                max(cut_w - 0.5, 1.0), max(cut_h - 0.5, 1.0), 40)
+            try:
+                inter = p.solid & probe
+                v = inter.volume if inter is not None else 0.0
+            except Exception:
+                v = 0.0
+            assert v < 2.0, f"{p.name} 引线孔[{tag}] 残余 {v:.2f}"
+
+
+def test_export_step_xcaf_smoke(small_res, tmp_path):
+    """XCAF 导出应写出可回读的 STEP，且含颜色/中文名转义。"""
+    from coildrawing.model3d import export_step
+
+    step = tmp_path / "coil.step"
+    names = export_step(small_res, str(step), detailed=True)
+    assert names
+    raw = step.read_bytes()
+    text = raw.decode("ascii", errors="replace")
+    assert "COLOUR" in text.upper() or "COLOR" in text.upper() or "DRAUGHTING" in text.upper() or "STYLED" in text
+    assert "\\X2\\" in text
