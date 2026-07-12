@@ -20,6 +20,149 @@ def small_res():
     return compute(inp)
 
 
+def test_loop_material_frame_orientation(small_res):
+    """材料匝位轴必须在两槽边反向，并在两个 nose 沿轴向立起。"""
+    from coildrawing.model3d import _loop_frames, _radial_of
+
+    frames = _loop_frames(small_res)
+    assert frames.f_leg1.y.dot(_radial_of(frames.f_leg1.o)) == \
+        pytest.approx(1.0, abs=1e-10)
+    assert frames.f_leg2.y.dot(_radial_of(frames.f_leg2.o)) == \
+        pytest.approx(-1.0, abs=1e-10)
+    assert tuple(frames.f_flat_pos.y) == pytest.approx((0.0, 0.0, 1.0), abs=1e-10)
+    assert tuple(frames.f_flat_neg.y) == pytest.approx((0.0, 0.0, -1.0), abs=1e-10)
+
+
+def test_lead_end_choice_mirrors_complete_detailed_model():
+    """换出线端须镜像整只线圈，而不只是移动两根引线。"""
+    from coildrawing.model3d import build_coil_parts
+
+    inp_pos = CoilInput()
+    inp_pos.n_turns = 1       # 镜像不变量与匝数无关，单匝可缩短测试时间
+    inp_pos.lead_end_positive_z = True
+    pos_parts = build_coil_parts(compute(inp_pos), detailed=True)
+
+    inp_neg = CoilInput()
+    inp_neg.n_turns = 1
+    inp_neg.lead_end_positive_z = False
+    neg_parts = build_coil_parts(compute(inp_neg), detailed=True)
+
+    assert [p.name for p in neg_parts] == [p.name for p in pos_parts]
+    for pos, neg in zip(pos_parts, neg_parts):
+        assert neg.solid.volume == pytest.approx(
+            pos.solid.volume, rel=1e-10, abs=1e-6), pos.name
+        bb_pos = pos.solid.bounding_box()
+        bb_neg = neg.solid.bounding_box()
+        assert bb_neg.min.Z == pytest.approx(-bb_pos.max.Z, abs=1e-6), pos.name
+        assert bb_neg.max.Z == pytest.approx(-bb_pos.min.Z, abs=1e-6), pos.name
+
+    # 明确覆盖两类关键实体，避免未来因改名/条件构造而弱化上述逐件断言。
+    names = [p.name for p in pos_parts]
+    assert any(n.startswith("铜导线") for n in names)
+    assert any(n.startswith("对地绝缘") for n in names)
+
+
+def test_four_turn_detailed_copper_is_one_solid():
+    """四匝铜线须为一个实体，且融合前后体积相同（无自重叠）。"""
+    from coildrawing import model3d as m
+
+    inp = CoilInput()
+    inp.n_turns = 4
+    res = compute(inp)
+    segments, _ = m._wire_segments(res)
+    _, _, strands = m._strand_grid(res)
+    strand = strands[0]
+    solids = [m._seg_solid(g, strand["b"], strand["h"],
+                           strand["x"], strand["y"])
+              for g in segments]
+    solids = [solid for solid in solids if solid is not None]
+    copper = m._join(solids)
+    assert len(copper.solids()) == 1
+    assert copper.volume == pytest.approx(
+        sum(solid.volume for solid in solids), rel=1e-10, abs=1e-5)
+
+
+def test_default_eight_turn_copper_segments_are_constructible():
+    """默认八匝参数的每一段铜线都必须能生成有效实体。"""
+    from coildrawing import model3d as m
+
+    res = compute(CoilInput())
+    segments, _ = m._wire_segments(res)
+    _, _, strands = m._strand_grid(res)
+    strand = strands[0]
+    solids = [m._seg_solid(g, strand["b"], strand["h"],
+                           strand["x"], strand["y"])
+              for g in segments]
+    assert all(solid is not None and solid.volume > 0 for solid in solids)
+
+
+def test_nose_connection_corners_use_rd2_not_nose_rd():
+    """斜边—nose 圆角应取 rd2；RD 只定义 nose 本体半径/展开宽度。"""
+    from coildrawing import model3d as m
+
+    inp = CoilInput(rd_nose=15.0, r_bend_nose=42.0)
+    _, fillets = m._loop_fillets(compute(inp))
+    for index in (2, 3, 6, 7):
+        assert (fillets[index].ts - fillets[index].c).length == \
+            pytest.approx(42.0, abs=1e-8)
+
+
+def test_f_nose_raises_both_noses_without_moving_slot_legs():
+    """F 应让 +Z/-Z 两个 nose 一起朝槽底抬高，槽内直边保持不动。"""
+    from coildrawing import model3d as m
+
+    low, _ = m._loop_fillets(compute(CoilInput(f_nose=5.0)))
+    high, _ = m._loop_fillets(compute(CoilInput(f_nose=32.0)))
+
+    def radius(corner):
+        point = corner[0]
+        return (point.X ** 2 + point.Y ** 2) ** 0.5
+
+    for index in (2, 3, 6, 7):
+        assert radius(high[index]) - radius(low[index]) == \
+            pytest.approx(27.0, abs=1e-8)
+    for index in (0, 1, 4, 5):
+        assert radius(high[index]) == pytest.approx(
+            radius(low[index]), abs=1e-8)
+
+
+def test_wire_segments_have_no_centerline_gaps():
+    """逐匝路径的每个相邻解析分段必须在同一材料中心点相接。"""
+    from coildrawing import model3d as m
+
+    inp = CoilInput()
+    inp.n_turns = 4
+    segments, _ = m._wire_segments(compute(inp))
+
+    def y_axis(frame):
+        return frame.y if hasattr(frame, "y") else frame.ey
+
+    def center(frame, dy):
+        return frame.o + y_axis(frame) * dy
+
+    def endpoints(segment):
+        if isinstance(segment, m._Prism):
+            start = center(segment.f, segment.dy)
+            return start, start + segment.f.t * segment.length
+        if isinstance(segment, m._Rev):
+            start = center(segment.f, segment.dy)
+            end = segment.fl.c + m._rotv(
+                start - segment.fl.c, segment.fl.n, segment.fl.tau)
+            return start, end
+        if isinstance(segment, m._Loft):
+            return (center(segment.f0, segment.dy0),
+                    center(segment.f1, segment.dy1))
+        raise AssertionError(f"未知分段类型: {type(segment).__name__}")
+
+    gaps = []
+    for index, (left, right) in enumerate(zip(segments, segments[1:])):
+        gap = (endpoints(left)[1] - endpoints(right)[0]).length
+        gaps.append((gap, index, type(left).__name__, type(right).__name__))
+    worst = max(gaps)
+    assert worst[0] < 1e-6, \
+        f"分段 {worst[1]} {worst[2]}→{worst[3]} 中心断裂 {worst[0]:.6g}mm"
+
+
 def test_detailed_parts_geometry(small_res):
     from coildrawing.model3d import build_coil_parts
 

@@ -70,6 +70,8 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
         ("逐匝精细", "detail_3d",       "是=逐匝精细模型，否=简化束模型", "b"),
         ("引线折弯半径", "lead_bend_r",  "mm", "f"),
         ("引线端头裸铜长", "lead_bare",  "mm，0=不留", "f"),
+        ("出线端在正轴端", "lead_end_positive_z",
+         "是=端部侧视图右端（轴向 +Z），否=左端（轴向 -Z）", "b"),
         ("防晕层", "corona_on",         "是否绘制槽部防晕层（厚度取 CS）", "b"),
         ("防晕层每端伸出", "corona_overhang",
          "mm，沿导线计量，可越过槽口弯角沿端臂延伸", "f"),

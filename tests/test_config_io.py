@@ -27,12 +27,20 @@ def test_roundtrip_modified():
         wire2=WireSpec(b=7.0, h=1.2, t0=0.05, npd=1, ncd=1),
         cs=0.3, xi=1e-9, corona_on=True, corona_overhang=120.0,
         draw_wedge=True, draw_wihm=True, detail_3d=False,
+        lead_end_positive_z=False,
         layers=[InsulationLayer("云母带 A", 0.5),
                 InsulationLayer("云母带 B", 0.6)],
         turn_layers=[InsulationLayer("匝间带", 0.15000001)],
     )
     back = parse_config_text(config_text(inp))
     assert asdict(back) == asdict(inp)
+
+
+def test_bundled_template_includes_lead_end_choice():
+    template = (Path(__file__).resolve().parents[1] /
+                "docs" / "config_template.txt").read_text(encoding="utf-8")
+    assert "出线端在正轴端" in template
+    assert parse_config_text(template).lead_end_positive_z is True
 
 
 def test_hand_edit_tolerance():
@@ -45,6 +53,7 @@ NS = 96
 [三维模型]
 防晕层 = true
 画层间垫片 = 开
+出线端在正轴端 = 否
 
 [匝绝缘分层]
 层1 = 0.2
@@ -54,6 +63,7 @@ NS = 96
     assert inp.ns == 96
     assert inp.corona_on is True
     assert inp.draw_wihm is True
+    assert inp.lead_end_positive_z is False
     assert inp.lc == CoilInput().lc          # 缺失 → 默认
     assert inp.turn_layers[0].thickness == 0.2
 

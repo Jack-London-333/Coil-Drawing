@@ -342,12 +342,18 @@ class MainWindow(QMainWindow):
                                  "简化束模型（等效整束，生成快）"])
         self.in_leadbr = _dnum(15.0, 1, 200)
         self.in_leadbare = _dnum(30.0, 0, 300)
+        self.in_lead_end = NoWheelComboBox()
+        self.in_lead_end.addItems([
+            "端部侧视图右端（轴向 +Z）",
+            "端部侧视图左端（轴向 -Z）",
+        ])
         self.in_corona = QCheckBox("绘制槽部防晕层（黑色半导电层，厚度=CS）")
         self.in_corona.toggled.connect(self._on_corona_toggled)
         self.in_corona_ov = _dnum(50.0, 0, 1000)
         f4b.addRow("导出 STEP 模型", self.in_detail)
         f4b.addRow("引线折弯半径 (mm)", self.in_leadbr)
         f4b.addRow("引线端头裸铜长 (mm, 0=不留)", self.in_leadbare)
+        f4b.addRow("出线端位置", self.in_lead_end)
         f4b.addRow(self.in_corona)
         f4b.addRow("防晕层每端伸出铁芯 (mm, 沿导线)", self.in_corona_ov)
         lbl_cor = QLabel("伸出超过直线段时自动越过槽口弯角、沿端臂向鼻端延伸")
@@ -494,6 +500,7 @@ class MainWindow(QMainWindow):
             turn_layers=self.grp_turn.layers(),
             lead_bend_r=self.in_leadbr.value(),
             lead_bare=self.in_leadbare.value(),
+            lead_end_positive_z=self.in_lead_end.currentIndex() == 0,
             corona_on=self.in_corona.isChecked(),
             corona_overhang=self.in_corona_ov.value(),
             detail_3d=self.in_detail.currentIndex() == 0,
@@ -529,6 +536,7 @@ class MainWindow(QMainWindow):
         self.in_detail.setCurrentIndex(0 if inp.detail_3d else 1)
         self.in_leadbr.setValue(inp.lead_bend_r)
         self.in_leadbare.setValue(inp.lead_bare)
+        self.in_lead_end.setCurrentIndex(0 if inp.lead_end_positive_z else 1)
         self.in_corona.setChecked(inp.corona_on)
         self.in_corona_ov.setValue(inp.corona_overhang)
         self.in_draw_wedge.setChecked(inp.draw_wedge)

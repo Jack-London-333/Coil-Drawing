@@ -128,6 +128,7 @@ class CoilInput:
     ])
     lead_bend_r: float = 15.0     # 引线折弯半径 mm（引线伸出长度用 ysc）
     lead_bare: float = 30.0       # 引线端头裸铜长度 mm（0=不留）
+    lead_end_positive_z: bool = True  # 出线端：True=轴向 +Z，False=轴向 -Z
     corona_on: bool = False       # 是否绘制槽部防晕层（厚度=CS）
     corona_overhang: float = 50.0  # 防晕层每端伸出铁芯长度 mm（沿导线，可越过弯角沿端臂延伸）
     detail_3d: bool = True        # 导出 STEP 时使用逐匝精细模型

@@ -216,6 +216,7 @@ def draw_axial_view(ax, res: CoilResult) -> None:
     zl = res.l2 / 2
     z_end = zl + res.cc
     nose_h = 2 * inp.rd_nose
+    lead_sign = 1.0 if inp.lead_end_positive_z else -1.0
 
     # 铁芯区域（剖面线）
     ax.add_patch(Rectangle((-inp.lc / 2, -res.aa1 * 0.16), inp.lc, res.aa1 * 0.10,
@@ -231,12 +232,16 @@ def draw_axial_view(ax, res: CoilResult) -> None:
                 lw=LW_BOLD * 1.6, zorder=5)
         ax.plot([sgn * z_end, sgn * z_end], [res.aa1, res.aa1 + nose_h],
                 color="k", lw=LW_BOLD * 1.6, zorder=5)
-    # 引线（接线侧，轴向伸出）
-    ax.plot([z_end, z_end + inp.ysc], [res.aa1 + nose_h * 0.4] * 2,
+    # 引线（接线侧，轴向伸出）。只做 Z 向镜像，不变更上/下层。
+    lead_y = res.aa1 + nose_h * 0.4
+    lead_base_x = lead_sign * z_end
+    lead_tip_x = lead_sign * (z_end + inp.ysc)
+    ax.plot([lead_base_x, lead_tip_x], [lead_y] * 2,
             color=C_COPPER, lw=LW_BOLD * 1.5, zorder=6)
-    _leader(ax, (z_end + inp.ysc * 0.75, res.aa1 + nose_h * 0.4),
-            (z_end - 46, res.aa1 + nose_h * 1.06),
-            f"引线×2 ysc={inp.ysc:g}", ha="right")
+    lead_ha = "right" if lead_sign > 0 else "left"
+    _leader(ax, (lead_sign * (z_end + inp.ysc * 0.75), lead_y),
+            (lead_sign * (z_end - 46), res.aa1 + nose_h * 1.06),
+            f"引线×2 ysc={inp.ysc:g}", ha=lead_ha)
 
     _leader(ax, (0.4 * zl, 0), (0.30 * zl, res.aa1 * 0.30), "直线部(槽内+伸出)")
     mid_s = ((zl + z_end) / 2, res.aa1 / 2)
@@ -255,7 +260,10 @@ def draw_axial_view(ax, res: CoilResult) -> None:
 
     _view_title(ax, "端部侧视图（斜边按展开长度画出）")
     ax.set_aspect("auto")
-    ax.set_xlim(-z_end * 1.10, z_end + inp.ysc + 90)
+    if lead_sign > 0:
+        ax.set_xlim(-z_end * 1.10, z_end + inp.ysc + 90)
+    else:
+        ax.set_xlim(-z_end - inp.ysc - 90, z_end * 1.10)
     ax.set_ylim(-res.aa1 * 0.55, res.aa1 * 1.65)
     ax.axis("off")
 
