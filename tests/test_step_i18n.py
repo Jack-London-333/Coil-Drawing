@@ -72,3 +72,21 @@ def test_fix_step_names_idempotent(tmp_path):
     n2 = fix_step_names(step, header_name=asm.label)
     assert n2 == 0
     assert step.read_bytes() == first
+
+
+def test_fix_step_names_removes_occt_layout_break_inside_long_name(tmp_path):
+    """OCCT 的字符串行宽换行不得变成 SolidWorks 组件名中的 U+000A。"""
+    original = "匝绝缘1-匝间云母带-第7匝-主体"
+    wrapped = original[:-1] + "\n" + original[-1]
+    step = tmp_path / "wrapped_name.step"
+    step.write_text(
+        "ISO-10303-21;\nDATA;\n"
+        f"#1=PRODUCT('{wrapped}','','',());\n"
+        "ENDSEC;\nEND-ISO-10303-21;\n",
+        encoding="utf-8",
+    )
+
+    assert fix_step_names(step) == 1
+    text = step.read_text(encoding="ascii")
+    assert x2_escape(original) in text
+    assert "000A" not in text

@@ -69,7 +69,15 @@ def _recover_original(literal_body: str) -> str | None:
       * UTF-8 字节被按 Latin-1 展开成 U+0080..U+00FF 字符（当前 build123d 行为）；
       * 已是正确 Unicode（未来 build123d 修复后仍安全）。
     """
+    # OCCT 会为控制 STEP 行宽而在较长字符串字面量中插入物理换行；
+    # 这些换行不是零件名的一部分。若原样进入 x2_escape，会变成
+    # ``000A``，SolidWorks 随后真的在组件名和临时文件名中保留换行。
+    # STEP 产品名不需要多行语义，因此在恢复编码前确定性去除 CR/LF。
+    had_layout_break = "\r" in literal_body or "\n" in literal_body
+    literal_body = literal_body.replace("\r", "").replace("\n", "")
     if all(0x20 <= ord(c) <= 0x7E for c in literal_body):
+        if had_layout_break:
+            return literal_body.replace("''", "'")
         return None
     text = literal_body.replace("''", "'")
     if all(ord(c) <= 0xFF for c in text):

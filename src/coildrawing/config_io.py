@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import configparser
 import io
+import math
 from dataclasses import fields as dc_fields
 
 from .engine import CoilInput, InsulationLayer, WireSpec
 
 CONFIG_NAME = "config.txt"
 
-# (INI键, 属性路径, 注释, 类型)；类型: f=float, i=int, b=bool
+# (INI键, 属性路径, 注释, 类型)；类型: f=float, i=int, b=bool,
+# deg=界面/配置用角度、CoilInput 内部用弧度
 _SECTIONS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
     ("铁芯与槽", [
         ("D2",   "d2",    "定子铁芯内径 mm", "f"),
@@ -46,29 +48,31 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
         ("NCD2", "wire2.ncd", "导线2 每匝层数", "i"),
     ]),
     ("绝缘", [
-        ("T1", "t1", "槽内匝间绝缘单边厚 mm", "f"),
-        ("T3", "t3", "端部匝间绝缘单边厚 mm", "f"),
-        ("T2", "t2", "槽内对地绝缘单边厚 mm", "f"),
-        ("T4", "t4", "端部对地绝缘单边厚 mm", "f"),
+        ("T1", "t1", "槽内匝间绝缘单边厚 mm（当前 3D 要求 T1=T3）", "f"),
+        ("T3", "t3", "端部匝间绝缘单边厚 mm（当前 3D 要求 T3=T1）", "f"),
+        ("T2", "t2", "槽内对地绝缘单边厚 mm（当前 3D 要求 T2=T4）", "f"),
+        ("T4", "t4", "端部对地绝缘单边厚 mm（当前 3D 要求 T4=T2）", "f"),
         ("CS", "cs", "槽内防晕层单边厚 mm（三维防晕层厚度同此值）", "f"),
     ]),
     ("端部结构", [
         ("LD",     "ld",           "齿压板轴向长度 mm", "f"),
         ("LE",     "le",           "直线部伸出铁芯长度 mm", "f"),
         ("F",      "f_nose",       "鼻端抬高 mm", "f"),
-        ("seita3", "seita3",       "鼻端中心线夹角 rad", "f"),
-        ("RD",     "rd_nose",      "鼻端半径 mm", "f"),
+        ("seita3_deg", "seita3",
+         "鼻端中心线与径向直径夹角 °（常用 70–90°）", "deg"),
+        ("RD",     "rd_nose",
+         "鼻端内弯半径 mm（Rc=RD+WA/2；Larm按LLM守恒自动反算）", "f"),
         ("RD1",    "rd1_conn",     "接线侧弯弧半径 mm", "f"),
         ("RD2",    "rd2_nonconn",  "非接线侧弯弧半径 mm", "f"),
         ("rd1",    "r_bend_slot",  "直线部-斜边弯曲半径 mm（注意与 RD1 区分大小写）", "f"),
         ("rd2",    "r_bend_nose",  "斜边-鼻端弯曲半径 mm（注意与 RD2 区分大小写）", "f"),
         ("Ba",     "ba",           "端部间隙给定值 mm", "f"),
-        ("ysc",    "ysc",          "引线长 mm", "f"),
+        ("ysc",    "ysc",          "引线折弯后轴向自由直段长 mm", "f"),
         ("xi",     "xi",           "端部迭代误差设定值 ξ", "f"),
     ]),
     ("三维模型", [
         ("逐匝精细", "detail_3d",       "是=逐匝精细模型，否=简化束模型", "b"),
-        ("引线折弯半径", "lead_bend_r",  "mm", "f"),
+        ("引线折弯半径", "lead_bend_r",  "两段反向等角错位圆弧半径 mm", "f"),
         ("引线端头裸铜长", "lead_bare",  "mm，0=不留", "f"),
         ("出线端在正轴端", "lead_end_positive_z",
          "是=端部侧视图右端（轴向 +Z），否=左端（轴向 -Z）", "b"),
@@ -85,7 +89,8 @@ _SECTIONS: list[tuple[str, list[tuple[str, str, str, str]]]] = [
 _HEADER = """\
 ; ============================================================
 ;  CoilDrawing 工作空间配置文件（config.txt）
-;  * 单位：长度 mm、角度 rad；数值支持最多 8 位小数（可用科学计数法）
+;  * 单位：长度 mm、角度 °；数值支持最多 8 位小数（可用科学计数法）
+;    旧版键 seita3（弧度）仍可读取；新键 seita3_deg 优先
 ;  * 开关量填：是/否（也接受 true/false、1/0、开/关）
 ;  * 分号 ; 之后为注释；本文件由软件自动维护，手工修改保存后
 ;    软件会检测到变化并提示是否载入
@@ -137,6 +142,8 @@ def config_text(inp: CoilInput) -> str:
                 txt = "是" if v else "否"
             elif typ == "i":
                 txt = str(int(v))
+            elif typ == "deg":
+                txt = _num(math.degrees(float(v)))
             else:
                 txt = _num(float(v))
             out.write(f"{_pad_to(key, 16)}= {_pad_to(txt, 18)}; {comment}\n")
@@ -204,12 +211,27 @@ def parse_config_text(text: str) -> CoilInput:
                     val = _parse_bool(raw)
                 elif typ == "i":
                     val = int(float(raw))
+                elif typ == "deg":
+                    val = math.radians(float(raw))
                 else:
                     val = float(raw)
             except ValueError as exc:
                 raise ValueError(
                     f"[{section}] {key} = {raw!r} 解析失败：{exc}") from exc
             _set(inp, path, val)
+
+    # 向后兼容 v202607130557 及更早版本：旧键 seita3 的单位为弧度。
+    # 同时出现时，新键 seita3_deg 已在上方解析，应当优先。
+    nose_section = "端部结构"
+    if (cp.has_section(nose_section)
+            and "seita3_deg" not in cp[nose_section]
+            and "seita3" in cp[nose_section]):
+        raw = cp[nose_section]["seita3"].strip()
+        try:
+            inp.seita3 = float(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"[{nose_section}] seita3 = {raw!r} 解析失败：{exc}") from exc
     try:
         if cp.has_section("对地绝缘分层"):
             inp.layers = _parse_layers(cp["对地绝缘分层"])

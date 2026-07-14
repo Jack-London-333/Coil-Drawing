@@ -105,14 +105,18 @@ class CoilInput:
     ld: float = 20.0         # 铁芯端部齿压板轴向长度 mm
     le: float = 20.0         # 线圈直线部分伸出铁芯长度 mm
     f_nose: float = 20.0     # 线圈端部鼻端抬高 mm
-    seita3: float = 0.349    # 鼻端中心线与过鼻端弯弧中心点直径的夹角 rad
-    rd_nose: float = 15.0    # 线圈端部鼻端半径 RD mm
+    # 成型线圈通常位于 70°–90°；80°作为新建工作区默认值。
+    # 低角度仍可输入，但建模时必须通过紧凑相切可行性检查。
+    # 专利定义：鼻端中心线与径向直径的夹角。端面内 U 形对称轴
+    # 相对径向的偏角为 pi/2-seita3。
+    seita3: float = math.radians(80.0)  # 内部 rad（UI/新配置用 °）
+    rd_nose: float = 15.0    # 线圈端部鼻端内弯半径 RD mm
     rd1_conn: float = 15.0   # 接线侧弯弧半径 RD1 mm（用于 E1）
     rd2_nonconn: float = 15.0  # 非接线侧弯弧半径 RD2 mm（用于 E2）
     r_bend_slot: float = 30.0  # 直线部与端部斜边连接处弯曲半径 rd1 mm
     r_bend_nose: float = 30.0  # 端部斜边与鼻端连接处弯曲半径 rd2 mm
     ba: float = 7.0          # 线圈端部间隙给定值 mm
-    ysc: float = 45.0        # 引线长 mm
+    ysc: float = 45.0        # 引线折弯后的轴向自由直段长 mm
     xi: float = 1e-9         # 端部迭代误差设定值 ξ
 
     # --- 三维模型的对地绝缘分层（单边厚度，供 3D/大样使用） ---
@@ -126,7 +130,7 @@ class CoilInput:
     turn_layers: list[InsulationLayer] = field(default_factory=lambda: [
         InsulationLayer("匝间云母带", 0.15),
     ])
-    lead_bend_r: float = 15.0     # 引线折弯半径 mm（引线伸出长度用 ysc）
+    lead_bend_r: float = 15.0     # 两段反向等角引线错位圆弧半径 mm
     lead_bare: float = 30.0       # 引线端头裸铜长度 mm（0=不留）
     lead_end_positive_z: bool = True  # 出线端：True=轴向 +Z，False=轴向 -Z
     corona_on: bool = False       # 是否绘制槽部防晕层（厚度=CS）
@@ -377,9 +381,10 @@ def compute(inp: CoilInput, aa_override: tuple[float, float] | None = None) -> C
     res.xe = res.rr1 * math.sin(res.fai1)
     res.ye = res.rr1 * math.cos(res.fai1)
     rk = res.rr1 + inp.f_nose + res.hc * math.sin(inp.seita3)
-    # k 点周向偏离线圈中心线约一个鼻端半径（与专利算例 Xk=15=RD 一致）
-    res.xk = min(inp.rd_nose, 0.9 * rk)
-    res.yk = math.sqrt(rk * rk - res.xk * res.xk)
+    # 严格采用权利要求通式。专利具体实施例印出的 Xk=15、Yk=489.6
+    # 与该通式及同页给出的 fai2 数值矛盾，不能用实施例印刷值替代公式。
+    res.xk = rk * math.sin(res.fai2)
+    res.yk = rk * math.cos(res.fai2)
     a_ln = (res.yk - res.ye) / (res.xk - res.xe)
     c_ln = res.ye - (res.yk - res.ye) * res.xe / (res.xk - res.xe)
     res.d_min = abs(c_ln) / math.sqrt(a_ln * a_ln + 1.0)
@@ -450,6 +455,8 @@ def compute(inp: CoilInput, aa_override: tuple[float, float] | None = None) -> C
     res.k2 = rsum * (4 * (math.pi / 2 - seita4) - 4 * math.tan(math.pi / 4 - res.seita2 / 2))
     res.llm = (2 * res.s1 + 2 * res.s2 + res.x1 + res.x2 + res.k1 + res.k2
                + 2 * math.pi * (inp.rd_nose + res.wa_turn / 2))
+    # 三维 nose 的直臂长度不是额外输入：建模器以本 LLM 为目标，
+    # 先求零直臂基准长度 L0，再由 Larm=(LLM-L0)/4 保持匝长守恒。
     res.wire_total = res.llm * n + 2 * inp.ysc
 
     # ---------- 步骤6 梯形梭形 ----------
@@ -467,6 +474,12 @@ def compute(inp: CoilInput, aa_override: tuple[float, float] | None = None) -> C
                + math.pi * (inp.rd_nose + res.hd / 2))
 
     # ---------- 三维绝缘分层与对地绝缘厚度一致性检查 ----------
+    if (not math.isclose(inp.t1, inp.t3, rel_tol=0.0, abs_tol=1e-6)
+            or not math.isclose(inp.t2, inp.t4, rel_tol=0.0, abs_tol=1e-6)):
+        res.warnings.append(
+            "当前三维实体仅支持 T1=T3 且 T2=T4；参数计算与二维图仍可使用，"
+            "但为避免 nose 绝缘互穿或厚度错误，STEP 三维模型将停止生成")
+
     layer_sum = sum(l.thickness for l in inp.layers if l.thickness > 0)
     if inp.layers and abs(layer_sum - inp.t2) > 0.051:
         res.warnings.append(

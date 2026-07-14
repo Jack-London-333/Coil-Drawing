@@ -1,4 +1,4 @@
-"""3D 建模冒烟测试：用专利算例参数生成 STEP。"""
+"""3D 建模冒烟测试：用缩小内径的默认参数生成 STEP。"""
 import sys
 import time
 from pathlib import Path

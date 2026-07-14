@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 
 from .engine import CoilInput, CoilResult
 
@@ -40,8 +41,9 @@ def input_rows(inp: CoilInput) -> list[tuple[str, str, str, str]]:
         ("LD", "齿压板轴向长度", f"{inp.ld:g}", "mm"),
         ("LE", "直线部伸出铁芯长度", f"{inp.le:g}", "mm"),
         ("F", "鼻端抬高", f"{inp.f_nose:g}", "mm"),
-        ("seita3", "鼻端中心线夹角", f"{inp.seita3:g}", "rad"),
-        ("RD", "鼻端半径", f"{inp.rd_nose:g}", "mm"),
+        ("seita3", "鼻端中心线与径向直径夹角",
+         f"{math.degrees(inp.seita3):g}", "°"),
+        ("RD", "鼻端内弯半径", f"{inp.rd_nose:g}", "mm"),
         ("RD1", "接线侧弯弧半径", f"{inp.rd1_conn:g}", "mm"),
         ("RD2", "非接线侧弯弧半径", f"{inp.rd2_nonconn:g}", "mm"),
         ("rd1", "直线部-斜边弯曲半径", f"{inp.r_bend_slot:g}", "mm"),

@@ -1,4 +1,5 @@
 """config.txt 读写往返测试。"""
+import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -25,7 +26,8 @@ def test_roundtrip_modified():
         d2=921.50000001, lc=1250.12345678, ns=72, taw=7, n_turns=3,
         wire1=WireSpec(b=4.0, h=1.6, t0=0.1, npd=2, ncd=2),
         wire2=WireSpec(b=7.0, h=1.2, t0=0.05, npd=1, ncd=1),
-        cs=0.3, xi=1e-9, corona_on=True, corona_overhang=120.0,
+        cs=0.3, xi=1e-9, seita3=math.radians(37.5),
+        corona_on=True, corona_overhang=120.0,
         draw_wedge=True, draw_wihm=True, detail_3d=False,
         lead_end_positive_z=False,
         layers=[InsulationLayer("云母带 A", 0.5),
@@ -36,10 +38,34 @@ def test_roundtrip_modified():
     assert asdict(back) == asdict(inp)
 
 
+def test_seita3_new_config_uses_degrees():
+    text = config_text(CoilInput())
+    assert "seita3_deg" in text
+    assert "seita3_deg      = 80" in text
+    assert "鼻端中心线与径向直径夹角" in text
+    assert "鼻端内弯半径" in text
+    assert "\nseita3 " not in text
+    assert math.isclose(parse_config_text(text).seita3,
+                        math.radians(80.0), rel_tol=0, abs_tol=1e-15)
+
+
+def test_seita3_legacy_radians_and_new_key_priority():
+    legacy = parse_config_text("[端部结构]\nseita3 = 0.5\n")
+    assert legacy.seita3 == 0.5
+
+    both = parse_config_text(
+        "[端部结构]\nseita3 = 0.5\nseita3_deg = 30\n")
+    assert math.isclose(both.seita3, math.radians(30.0),
+                        rel_tol=0, abs_tol=1e-15)
+
+
 def test_bundled_template_includes_lead_end_choice():
     template = (Path(__file__).resolve().parents[1] /
                 "docs" / "config_template.txt").read_text(encoding="utf-8")
     assert "出线端在正轴端" in template
+    assert "鼻端中心线与径向直径夹角" in template
+    assert "Rc=RD+WA/2" in template
+    assert "Larm按LLM守恒自动反算" in template
     assert parse_config_text(template).lead_end_positive_z is True
 
 

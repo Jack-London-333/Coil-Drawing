@@ -63,10 +63,24 @@ def test_step4_bend_judgement():
     r = compute(patent_input())
     assert r.gf == pytest.approx(481.45, abs=0.01)        # [0181]
     assert r.gi == pytest.approx(515.95, abs=0.15)        # [0182]
-    # 算例 D=463 < RR1=467，需弯弧 [0195]
+    rk = r.rr1 + r.inp.f_nose + r.hc * math.sin(r.inp.seita3)
+    # 权利要求通式；算例印出的 Xk=15、Yk=489.6 与通式自相矛盾。
+    assert r.xk == pytest.approx(rk * math.sin(r.fai2))
+    assert r.yk == pytest.approx(rk * math.cos(r.fai2))
+    # 本算例 fai1=fai2，按通式 e、k 位于同一径向线上，故 D=0，需弯弧。
     assert r.need_bend
     assert r.d_min < r.rr1
-    assert r.d_min == pytest.approx(463.0, rel=0.02)
+    assert r.d_min == pytest.approx(0.0, abs=1e-9)
+
+
+def test_xk_yk_patent_formula_at_80_degrees():
+    """回归用户 v202607131115 配置中的常用大角度鼻端参数。"""
+    inp = CoilInput(f_nose=60.0, seita3=math.radians(80.0), cs=0.3)
+    r = compute(inp)
+    rk = r.rr1 + inp.f_nose + r.hc * math.sin(inp.seita3)
+    assert r.xk == pytest.approx(rk * math.sin(r.fai2))
+    assert r.yk == pytest.approx(rk * math.cos(r.fai2))
+    assert r.xk == pytest.approx(157.965, abs=0.01)
 
 
 def test_step5_end_winding_with_patent_aa():
@@ -123,6 +137,18 @@ def test_slot_fit_warnings():
     bad.n_turns = 12  # 塞不下
     r = compute(bad)
     assert any("Ha" in w or "槽深" in w for w in r.warnings)
+
+
+def test_variable_insulation_sections_warn_before_3d_export():
+    inp = patent_input()
+    inp.t3 = inp.t1 + 0.1
+    res = compute(inp)
+    assert any("三维实体仅支持 T1=T3 且 T2=T4" in w for w in res.warnings)
+
+
+def test_equal_insulation_sections_have_no_3d_section_warning():
+    res = compute(patent_input())
+    assert not any("三维实体仅支持 T1=T3 且 T2=T4" in w for w in res.warnings)
 
 
 def test_two_wire_specs():

@@ -38,7 +38,7 @@ def run_smoke(out_dir: str) -> int:
     win.grab().save(str(out / "smoke_ui.png"))
     report.append(f"UI ok: {win.windowTitle()}")
 
-    res = compute(CoilInput())  # 专利算例
+    res = compute(CoilInput())  # 当前默认工作参数
     report.append(f"engine ok: LLM={res.llm:.1f} mm, CC={res.cc:.1f} mm")
 
     save_png(res, str(out / "smoke_drawing.png"))

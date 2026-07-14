@@ -106,6 +106,78 @@ def _view_title(ax, text):
     ax.set_title(text, fontsize=FS_TITLE - 1, pad=6, color="0.1")
 
 
+def _sample_fillet_points(fillet, count=32):
+    """采样三维解析圆弧，返回 ``(X, Y, Z)`` 点列。"""
+    from coildrawing import model3d as m
+
+    count = max(2, int(count))
+    start_vec = fillet.ts - fillet.c
+    values = []
+    for angle in np.linspace(0.0, fillet.tau, count):
+        point = fillet.c + m._rotv(start_vec, fillet.n, float(angle))
+        values.append((point.X, point.Y, point.Z))
+    return np.asarray(values)
+
+
+def _project_fillet_end(fillet, count=32):
+    """沿电机轴向观察圆弧：返回端面 ``(X, Y)`` 投影。"""
+    return _sample_fillet_points(fillet, count)[:, :2]
+
+
+def _project_nose_u(fillet, q_start, q_end, count=48):
+    """返回鼻端交叉卷环中心线的端面投影。
+
+    卷环贴着圆柱面（法向近似径向），沿轴向看整只环收缩为一个
+    扁椭圆弧——“人”字顶端的小圆环。
+    """
+    crown = _project_fillet_end(fillet, count)
+    return np.vstack((
+        (q_start.X, q_start.Y),
+        crown,
+        (q_end.X, q_end.Y),
+    ))
+
+
+def _nose_developed_profiles(res: CoilResult, transition: bool,
+                             count: int = 65, *,
+                             radius: float | None = None,
+                             sweep: float | None = None
+                             ) -> list[np.ndarray]:
+    """返回 nose 的 ``(环半径匝位, 卷环路径长度)`` 展开线。
+
+    横轴是各材料匝在环平面内同心嵌套的半径偏移（内匝环小、外匝
+    环大）。非接线侧返回 ``N`` 条固定匝位的完整卷环；接线侧返回
+    ``N-1`` 条换匝线。换匝与三维模型一致，按卷环总弧长作
+    smoothstep（同心螺旋），从材料匝 ``i`` 光顺接到相邻匝 ``i-1``。
+    匝位节距严格采用端部每匝高度 ``HBD``，而不是槽内 ``HAD``。
+    """
+    from coildrawing import model3d as m
+
+    n = res.inp.n_turns
+    if radius is None or sweep is None:
+        layout = m._nose_layout(res)
+        radius = (layout.pos.ts - layout.pos.c).length
+        sweep = layout.pos.tau
+    total = radius * sweep
+    offsets = res.hbd * (
+        np.arange(n - 1, -1, -1, dtype=float) - (n - 1) / 2.0)
+
+    if not transition:
+        stations = np.asarray((0.0, 0.5 * total, total))
+        return [np.column_stack((np.full(stations.shape, offset), stations))
+                for offset in offsets]
+
+    count = max(12, int(count))
+    stations = np.linspace(0.0, total, count + 1)
+    lam = stations / total
+    blend = lam * lam * (3.0 - 2.0 * lam)
+    profiles = []
+    for start, end in zip(offsets[:-1], offsets[1:]):
+        radial = start + (end - start) * blend
+        profiles.append(np.column_stack((radial, stations)))
+    return profiles
+
+
 # ======================================================================
 # 视图 1：端面投影图
 # ======================================================================
@@ -156,32 +228,64 @@ def draw_end_view(ax, res: CoilResult) -> None:
     top1 = rect_at(res.rr1, -res.fai1, res.w_slot, res.h_slot, C_COPPER, True)
     top2 = rect_at(res.rr2, +res.fai2, res.w_slot, res.h_slot, C_COPPER, True)
 
-    # 端部斜边投影
-    e = np.array([res.xe, res.ye])
-    k_ = np.array([res.xk, res.yk])
-    ax.plot([e[0], k_[0]], [e[1], k_[1]], color="k", lw=LW_BOLD, zorder=7)
-    e2 = np.array([res.rr2 * math.sin(res.fai2), res.rr2 * math.cos(res.fai2)])
-    rk2 = res.rr2 + inp.f_nose + res.hc * math.sin(inp.seita3)
-    k2 = np.array([-res.xk, math.sqrt(max(rk2 ** 2 - res.xk ** 2, 0.0))])
-    ax.plot([e2[0], k2[0]], [e2[1], k2[1]], color="k", lw=LW_BOLD, zorder=7)
+    # 端部实际中心线投影与三维共用同一组解析圆角。
+    # 旧版把 ±Xk 误当成小半径 nose 的两个端点；改用专利
+    # 通式后两点相距数百毫米，会让二维图与三维彻底分裂。
+    from coildrawing import model3d as m
 
-    # 鼻端圆
-    nose_c = (k_ + k2) / 2
-    nose_r = inp.rd_nose + res.wd / 2
-    tt = np.linspace(0, 2 * math.pi, 90)
-    ax.plot(nose_c[0] + nose_r * np.cos(tt), nose_c[1] + nose_r * np.sin(tt),
-            color="k", lw=LW_THIN * 1.2, zorder=6)
+    _, end_fillets = m._loop_fillets(res)
+    nose_layout = m._nose_layout(res)
+
+    # +Z 端投影依次为：端部斜边、rd2、交叉卷环（贴圆柱面的环沿
+    # 轴向投影为一个扁椭圆弧——“人”字顶端的小圆环）、rd2、端部
+    # 斜边。-Z 端投影与其重合，无需重复加粗。
+    for first, second in ((end_fillets[1], end_fillets[2]),
+                          (end_fillets[3], end_fillets[4])):
+        for fillet in (first, second):
+            points = _project_fillet_end(fillet, 24)
+            ax.plot(points[:, 0], points[:, 1], color="k", lw=LW_BOLD,
+                    zorder=8)
+        ax.plot([first.te.X, second.ts.X], [first.te.Y, second.ts.Y],
+                color="k", lw=LW_BOLD, zorder=8)
+
+    nose_u = _project_nose_u(
+        nose_layout.pos, end_fillets[2].te, end_fillets[3].ts, 97)
+    nose_line, = ax.plot(nose_u[:, 0], nose_u[:, 1], color="k",
+                         lw=LW_BOLD, zorder=8)
+    nose_line.set_gid("nose-end-complete-u")
+
+    # 专利判弧计算点 e/k 使用通式，作为灰色参考线单独表示；
+    # 它们不再被误画成 RD nose 的直径。
+    e = np.array([-res.xe, res.ye])
+    k_ = np.array([-res.xk, res.yk])
+    e2 = np.array([res.rr2 * math.sin(res.fai2),
+                   res.rr2 * math.cos(res.fai2)])
+    rk2 = res.rr2 + inp.f_nose + res.hc * math.sin(inp.seita3)
+    k2 = np.array([rk2 * math.sin(res.fai1),
+                   rk2 * math.cos(res.fai1)])
+    for left, right in ((e, k_), (e2, k2)):
+        ax.plot([left[0], right[0]], [left[1], right[1]],
+                color="0.45", lw=LW_THIN, ls=(0, (4, 3)), zorder=5)
+        ax.plot(right[0], right[1], marker="o", ms=2.8, color="0.35",
+                zorder=9)
+
+    nose_tip = np.array([nose_layout.pos.ma.X, nose_layout.pos.ma.Y])
+    nose_rc = (nose_layout.pos.ts - nose_layout.pos.c).length
+    nose_sweep = math.degrees(nose_layout.pos.tau)
 
     # 引出标注：上带（视图上方，错层）与下带（视图下方）分列
     y_top = hi_r + 14
-    _leader(ax, top1, (-xmax * 0.26, y_top + 15), "上层边(本线圈)", ha="right")
-    _leader(ax, (nose_c[0], nose_c[1] + nose_r), (xmax * 0.05, y_top),
-            f"鼻端 RD={inp.rd_nose:.0f}", ha="left")
-    _leader(ax, top2, (xmax * 0.38, y_top + 15), "下层边(本线圈)", ha="left")
+    _leader(ax, top1, (-xmax * 0.26, y_top + 30), "上层边(本线圈)", ha="right")
+    _leader(ax, nose_tip, (xmax * 0.05, y_top),
+            f"鼻端卷环 RD={inp.rd_nose:.1f}  Rc={nose_rc:.1f}\n"
+            f"扫角 {nose_sweep:.0f}°(交叉卷回)", ha="left")
+    _leader(ax, top2, (xmax * 0.38, y_top + 30), "下层边(本线圈)", ha="left")
     y_bot = lo - 24
-    mid1 = e * 0.42 + k_ * 0.58
-    mid2 = e2 * 0.42 + k2 * 0.58
-    _leader(ax, mid1, (-xmax * 0.10, y_bot), "上层端部斜边投影 e-k", ha="right")
+    mid1 = np.array([(end_fillets[1].te.X + end_fillets[2].ts.X) / 2,
+                     (end_fillets[1].te.Y + end_fillets[2].ts.Y) / 2])
+    mid2 = np.array([(end_fillets[3].te.X + end_fillets[4].ts.X) / 2,
+                     (end_fillets[3].te.Y + end_fillets[4].ts.Y) / 2])
+    _leader(ax, mid1, (-xmax * 0.10, y_bot), "上层端部斜边投影", ha="right")
     _leader(ax, mid2, (xmax * 0.48, y_bot), "下层端部斜边投影", ha="left")
 
     # 张角（弧放在视图下缘内侧）
@@ -200,11 +304,11 @@ def draw_end_view(ax, res: CoilResult) -> None:
             bbox=dict(boxstyle="square,pad=0.15", fc="white", ec="none",
                       alpha=0.85))
 
-    ax.text(0, y_top + 34, "端面投影图（沿轴向看）", fontsize=FS_TITLE - 1,
+    ax.text(0, y_top + 60, "端面投影图（沿轴向看）", fontsize=FS_TITLE - 1,
             ha="center", va="bottom", color="0.1")
     ax.set_aspect("equal")
     ax.set_xlim(-xmax, xmax)
-    ax.set_ylim(y_bot - 12, y_top + 52)
+    ax.set_ylim(y_bot - 12, y_top + 76)
     ax.axis("off")
 
 
@@ -215,8 +319,18 @@ def draw_axial_view(ax, res: CoilResult) -> None:
     inp = res.inp
     zl = res.l2 / 2
     z_end = zl + res.cc
-    nose_h = 2 * inp.rd_nose
     lead_sign = 1.0 if inp.lead_end_positive_z else -1.0
+
+    from coildrawing import model3d as m
+
+    nose_layout = m._nose_layout(res)
+    nose_rc = (nose_layout.pos.ts - nose_layout.pos.c).length
+    nose_sweep = nose_layout.pos.tau
+    nose_h = nose_rc * nose_sweep
+    nonconn_profiles = _nose_developed_profiles(
+        res, transition=False, radius=nose_rc, sweep=nose_sweep)
+    conn_profiles = _nose_developed_profiles(
+        res, transition=True, radius=nose_rc, sweep=nose_sweep)
 
     # 铁芯区域（剖面线）
     ax.add_patch(Rectangle((-inp.lc / 2, -res.aa1 * 0.16), inp.lc, res.aa1 * 0.10,
@@ -225,23 +339,50 @@ def draw_axial_view(ax, res: CoilResult) -> None:
             ha="center", va="center", color="0.25",
             bbox=dict(boxstyle="square,pad=0.15", fc=C_IRON, ec="none"))
 
-    # 直线部 / 端部斜边 / 鼻端（双线轮廓按线宽示意为粗实线）
+    # 直线部 / 端部斜边 / nose（线宽仅作示意）。纵坐标把卷环
+    # 中心线按路径长度展开，横坐标显示各材料匝在环平面内同心嵌套
+    # 的真实 HBD 半径匝位：非接线侧同位，接线侧沿卷环以同心螺旋
+    # 光顺换到相邻匝位。
     ax.plot([-zl, zl], [0, 0], color="k", lw=LW_BOLD * 1.6, zorder=5)
     for sgn in (+1, -1):
         ax.plot([sgn * zl, sgn * z_end], [0, res.aa1], color="k",
                 lw=LW_BOLD * 1.6, zorder=5)
-        ax.plot([sgn * z_end, sgn * z_end], [res.aa1, res.aa1 + nose_h],
-                color="k", lw=LW_BOLD * 1.6, zorder=5)
+
+    def draw_profiles(profiles, side_sign: float, gid: str, color: str):
+        for profile in profiles:
+            x = side_sign * (z_end + profile[:, 0])
+            line, = ax.plot(x, res.aa1 + profile[:, 1], color=color,
+                            lw=LW_BOLD, zorder=6)
+            line.set_gid(gid)
+
+    draw_profiles(conn_profiles, lead_sign, "nose-connection", "k")
+    draw_profiles(nonconn_profiles, -lead_sign, "nose-nonconnection", "0.25")
+
+    stack_half = (inp.n_turns - 1) * res.hbd / 2.0
+    conn_label_x = lead_sign * (z_end + stack_half)
+    nonconn_label_x = -lead_sign * (z_end + stack_half)
+    _leader(ax, (conn_label_x, res.aa1 + nose_h * 0.70),
+            (lead_sign * (z_end - 62), res.aa1 + nose_h * 1.13),
+            f"接线侧：{max(inp.n_turns - 1, 0)}个卷环螺旋换匝\n"
+            f"节距 HBD={res.hbd:.2f}",
+            ha="right" if lead_sign > 0 else "left")
+    _leader(ax, (nonconn_label_x, res.aa1 + nose_h * 0.42),
+            (-lead_sign * (z_end - 70), res.aa1 + nose_h * 0.98),
+            f"非接线侧：{inp.n_turns}个卷环同心嵌套",
+            ha="left" if lead_sign > 0 else "right")
+
     # 引线（接线侧，轴向伸出）。只做 Z 向镜像，不变更上/下层。
-    lead_y = res.aa1 + nose_h * 0.4
+    lead_ys = (res.hbd * 0.20, res.hbd * 0.70)
     lead_base_x = lead_sign * z_end
     lead_tip_x = lead_sign * (z_end + inp.ysc)
-    ax.plot([lead_base_x, lead_tip_x], [lead_y] * 2,
-            color=C_COPPER, lw=LW_BOLD * 1.5, zorder=6)
+    for lead_y in lead_ys:
+        lead_line, = ax.plot([lead_base_x, lead_tip_x], [lead_y] * 2,
+                             color=C_COPPER, lw=LW_BOLD * 1.5, zorder=7)
+        lead_line.set_gid("lead-wire")
     lead_ha = "right" if lead_sign > 0 else "left"
-    _leader(ax, (lead_sign * (z_end + inp.ysc * 0.75), lead_y),
-            (lead_sign * (z_end - 46), res.aa1 + nose_h * 1.06),
-            f"引线×2 ysc={inp.ysc:g}", ha=lead_ha)
+    _leader(ax, (lead_sign * (z_end + inp.ysc * 0.75), sum(lead_ys) / 2),
+            (lead_sign * (z_end - 46), res.aa1 * 0.24),
+            f"槽底侧引线×2  ysc={inp.ysc:g}", ha=lead_ha)
 
     _leader(ax, (0.4 * zl, 0), (0.30 * zl, res.aa1 * 0.30), "直线部(槽内+伸出)")
     mid_s = ((zl + z_end) / 2, res.aa1 / 2)
@@ -258,13 +399,17 @@ def draw_axial_view(ax, res: CoilResult) -> None:
             f"seita2={math.degrees(res.seita2):.1f}°",
             fontsize=FS_DIM, color=C_DIM, ha="center")
 
-    _view_title(ax, "端部侧视图（斜边按展开长度画出）")
+    _view_title(ax, "端部侧视图（完整U按路径长度展开）")
     ax.set_aspect("auto")
+    stack_extent = z_end + stack_half
     if lead_sign > 0:
-        ax.set_xlim(-z_end * 1.10, z_end + inp.ysc + 90)
+        ax.set_xlim(-stack_extent * 1.10,
+                    max(stack_extent, z_end + inp.ysc) + 90)
     else:
-        ax.set_xlim(-z_end - inp.ysc - 90, z_end * 1.10)
-    ax.set_ylim(-res.aa1 * 0.55, res.aa1 * 1.65)
+        ax.set_xlim(-max(stack_extent, z_end + inp.ysc) - 90,
+                    stack_extent * 1.10)
+    y_max = max(res.aa1 * 1.65, res.aa1 + nose_h * 1.28)
+    ax.set_ylim(-res.aa1 * 0.55, y_max)
     ax.axis("off")
 
 
