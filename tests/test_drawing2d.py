@@ -57,8 +57,12 @@ def test_end_projection_shows_crossed_curl():
     complete_u = _project_nose_u(
         layout.pos, fillets[2].te, fillets[3].ts, 65)
 
-    assert (layout.pos.ts - layout.pos.c).length == pytest.approx(rc)
-    assert (layout.pos.te - layout.pos.c).length == pytest.approx(rc)
+    # 环平面内半径恒为 Rc；浅螺旋错距只出现在盘面法向上。
+    for point in (layout.pos.ts, layout.pos.te):
+        v = point - layout.pos.c
+        in_plane = v - layout.pos.n * v.dot(layout.pos.n)
+        assert in_plane.length == pytest.approx(rc)
+    assert layout.pos.radius == pytest.approx(rc)
     assert (fillets[2].te - layout.q2).length == pytest.approx(0.0, abs=1e-9)
     assert (fillets[3].ts - layout.q3).length == pytest.approx(0.0, abs=1e-9)
     # 扫角超过 180°：交叉卷回。
@@ -73,16 +77,16 @@ def test_end_projection_shows_crossed_curl():
     np.testing.assert_allclose(
         complete_u[-1], (layout.q3.X, layout.q3.Y), atol=1e-10)
 
-    # 三维圆环上的采样点到环心的距离恒为 Rc（真实圆环，投影为
-    # 扁椭圆弧）。
+    # 三维卷环上的采样点到环轴的面内距离恒为 Rc（浅螺旋卷环，
+    # 投影为扁椭圆弧）。
     crown = _project_fillet_end(layout.pos, 65)
     assert crown.shape[0] == 65
     points3d = []
     for lam in np.linspace(0.0, 1.0, 33):
-        point = layout.pos.c + m._rotv(
-            layout.pos.ts - layout.pos.c, layout.pos.n,
-            layout.pos.tau * float(lam))
-        points3d.append((point - layout.pos.c).length)
+        point = layout.pos.point(layout.pos.tau * float(lam))
+        v = point - layout.pos.c
+        in_plane = v - layout.pos.n * v.dot(layout.pos.n)
+        points3d.append(in_plane.length)
     np.testing.assert_allclose(points3d, rc, atol=1e-9)
 
 

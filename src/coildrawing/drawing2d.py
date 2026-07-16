@@ -107,10 +107,14 @@ def _view_title(ax, text):
 
 
 def _sample_fillet_points(fillet, count=32):
-    """采样三维解析圆弧，返回 ``(X, Y, Z)`` 点列。"""
+    """采样三维解析圆弧/鼻端卷环，返回 ``(X, Y, Z)`` 点列。"""
     from coildrawing import model3d as m
 
     count = max(2, int(count))
+    if hasattr(fillet, "point"):        # _NoseCurl（浅螺旋卷环）
+        values = [fillet.point(float(angle))
+                  for angle in np.linspace(0.0, fillet.tau, count)]
+        return np.asarray([(p.X, p.Y, p.Z) for p in values])
     start_vec = fillet.ts - fillet.c
     values = []
     for angle in np.linspace(0.0, fillet.tau, count):
@@ -156,7 +160,7 @@ def _nose_developed_profiles(res: CoilResult, transition: bool,
     n = res.inp.n_turns
     if radius is None or sweep is None:
         layout = m._nose_layout(res)
-        radius = (layout.pos.ts - layout.pos.c).length
+        radius = layout.pos.radius
         sweep = layout.pos.tau
     total = radius * sweep
     offsets = res.hbd * (
@@ -270,7 +274,7 @@ def draw_end_view(ax, res: CoilResult) -> None:
                 zorder=9)
 
     nose_tip = np.array([nose_layout.pos.ma.X, nose_layout.pos.ma.Y])
-    nose_rc = (nose_layout.pos.ts - nose_layout.pos.c).length
+    nose_rc = nose_layout.pos.radius
     nose_sweep = math.degrees(nose_layout.pos.tau)
 
     # 引出标注：上带（视图上方，错层）与下带（视图下方）分列
@@ -324,7 +328,7 @@ def draw_axial_view(ax, res: CoilResult) -> None:
     from coildrawing import model3d as m
 
     nose_layout = m._nose_layout(res)
-    nose_rc = (nose_layout.pos.ts - nose_layout.pos.c).length
+    nose_rc = nose_layout.pos.radius
     nose_sweep = nose_layout.pos.tau
     nose_h = nose_rc * nose_sweep
     nonconn_profiles = _nose_developed_profiles(

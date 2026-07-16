@@ -69,3 +69,13 @@
 ## 待记录问题
 
 由用户查看和测试后填写。
+
+
+
+## 用户的问题
+
+nose部分的拓扑已经完全正确了，但我看到nose部分不完美，并且我在软件中改变seita3 的值，nose的角度仍然是这个状态，角度不会变化。 ![](C:\Users\19144\Desktop\CoilDrawing\some_user_problems\software-v202607142334-test\pics\nose不太完美.png)
+
+![](C:\Users\19144\Desktop\CoilDrawing\some_user_problems\software-v202607142334-test\pics\nose不太完美-2.png)
+
+请你把以上两张图的不那么完美的状态 和 正确完美的nose状态（![](C:\Users\19144\Desktop\CoilDrawing\some_user_problems\Reference-Pictures\完成涨形的筒形线圈.png)) 对比总结一下，因为这个session已经快爆满了，我需要进入新的空白session，但我又不太会组织语言。你得把prompt写好方便我直接复制粘贴到新的session。

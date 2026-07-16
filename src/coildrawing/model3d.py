@@ -106,19 +106,105 @@ class _Fillet:
     tau: float          # 转角 rad
 
 
+# 浅螺旋高度积分的 Gauss-Legendre 节点/权重（32 点，[-1,1]）。
+# 被积函数解析光滑，32 点误差远小于 1e-12 mm，供 LLM 反解使用。
+def _gauss_legendre_32() -> tuple[list[float], list[float]]:
+    import numpy as np
+
+    nodes, weights = np.polynomial.legendre.leggauss(32)
+    return list(nodes), list(weights)
+
+
+_GL_NODES, _GL_WEIGHTS = _gauss_legendre_32()
+
+
+@dataclass
+class _NoseCurl:
+    """鼻端交叉卷环：环平面内的圆 + 沿环法向的浅螺旋错距。
+
+    环平面 = 鼻端处两臂带面（法向 ``n``，0 偏航——盘面与带面贴合，
+    不再像独立的硬币斜骑在交叉点上）。交叉处两臂所需的错距
+    ``drop`` 沿整个扫角以 smoothstep 剖面消化（锁紧垫圈式浅螺旋，
+    升角仅几度，两端斜率为零——与 rd2 圆角所在的平面 G1 对接）：
+    入口环端在 ``+drop/2``、出口环端在 ``-drop/2``，环中点（鼻尖）
+    严格落在环平面内、位于 seita3 定义的鼻端中心线上。
+
+    ``theta`` 为从入口起沿环的转角；多匝同心嵌套由 ``dy``（环平面
+    内的半径增量，节距 HBD）表达，与螺旋高度方向正交。
+    """
+
+    c: "b3d.Vector"      # 环平面圆心
+    n: "b3d.Vector"      # 环平面单位法向（绕行角动量方向）
+    r0: "b3d.Vector"     # 入口处单位半径方向（环平面内）
+    radius: float        # 束中心环半径 Rc = RD + WA/2
+    tau: float           # 扫角 180° + 2β
+    drop: float          # 入口→出口沿 n 的总下降量（有符号）
+
+    def ydir(self, theta: float) -> "b3d.Vector":
+        return _rotv(self.r0, self.n, theta)
+
+    def height(self, theta: float) -> float:
+        return self.drop * (0.5 - _smoothstep(theta / self.tau))
+
+    def dheight(self, theta: float) -> float:
+        """dh/dθ。smoothstep 导数在两端为零。"""
+        lam = max(0.0, min(1.0, theta / self.tau))
+        return -self.drop * 6.0 * lam * (1.0 - lam) / self.tau
+
+    def point(self, theta: float, dy: float = 0.0) -> "b3d.Vector":
+        return (self.c + self.ydir(theta) * (self.radius + dy)
+                + self.n * self.height(theta))
+
+    def tangent(self, theta: float, dy: float = 0.0) -> "b3d.Vector":
+        y = self.ydir(theta)
+        return (self.n.cross(y) * (self.radius + dy)
+                + self.n * self.dheight(theta)).normalized()
+
+    def frame(self, theta: float, dy: float = 0.0) -> "_Frame":
+        """材料框架：y=环平面内半径方向（同心嵌套匝位方向），
+        t=螺旋切向（y⊥t 严格成立），x=y×t。零扭转。"""
+        t = self.tangent(theta, dy)
+        y = self.ydir(theta)
+        return _Frame(self.point(theta, dy), y.cross(t).normalized(), y, t)
+
+    def length(self, dy: float = 0.0) -> float:
+        """弧长 ∫√((R+dy)² + (dh/dθ)²) dθ（Gauss-Legendre）。"""
+        r = self.radius + dy
+        if abs(self.drop) <= 1e-12:
+            return r * self.tau
+        half = self.tau / 2.0
+        total = 0.0
+        for node, weight in zip(_GL_NODES, _GL_WEIGHTS):
+            theta = half * (node + 1.0)
+            total += weight * math.hypot(r, self.dheight(theta))
+        return total * half
+
+    @property
+    def ts(self) -> "b3d.Vector":
+        return self.point(0.0)
+
+    @property
+    def ma(self) -> "b3d.Vector":
+        return self.point(self.tau / 2.0)
+
+    @property
+    def te(self) -> "b3d.Vector":
+        return self.point(self.tau)
+
+
 @dataclass
 class _NoseLayout:
-    """两个交叉卷环 nose 的圆弧与 rd2 虚拟角点。
+    """两个交叉卷环 nose 的螺旋弧与 rd2 虚拟角点。
 
-    ``pos/neg`` 是 ±Z 两端的鼻端卷环圆弧（扫角 ``180°+2β``，两臂
+    ``pos/neg`` 是 ±Z 两端的鼻端卷环（扫角 ``180°+2β``，两臂
     先交叉、环从交叉点外侧卷回）。``q2/q3/q6/q7`` 是环的入口/出口
     切点（rd2 圆角恰在此结束/开始）；``p2/p3/p6/p7`` 是构造 rd2
     圆角所需的虚拟角点。多匝在环平面内同心嵌套：材料匝 ``i`` 的
     环半径 = 束中心环半径 + HBD 匝位偏移。
     """
 
-    pos: _Fillet
-    neg: _Fillet
+    pos: _NoseCurl
+    neg: _NoseCurl
     p2: "b3d.Vector"
     p3: "b3d.Vector"
     p6: "b3d.Vector"
@@ -161,15 +247,22 @@ def _nose_layout(res: CoilResult, dr: float = 0.0,
     """按 ``RD/F/seita3`` 构造 ±Z 两端的交叉卷环 nose。
 
     每个 nose 是涨形前平面梭形线圈鼻端的原样保留：两条端部斜边
-    收拢、**交叉**，然后在尖端外侧卷回一个**平面内的环**，环扫角
-    为 ``180°+2β``（β 是固定交叉半角 ``_NOSE_CROSS_BETA``），所以
+    收拢、**交叉**，然后在尖端外侧卷回一个环，环扫角为
+    ``180°+2β``（β 是固定交叉半角 ``_NOSE_CROSS_BETA``），所以
     看上去接近闭合的圆环。
 
-    环所在平面由切向（直径方向）和鼻端中心线张成：鼻端中心线
-    （环顶点方向，朝轴向端外）与径向直径严格成 ``seita3`` 角——
-    即专利对 seita3 的定义；环平面近似贴着圆柱面，并随 ``F`` 向
-    槽底抬高。环沿鼻端中心线的位置由 LLM 反解（``nose_axial_shift``，
-    基准位环心轴向在 ``zn = L2/2 + CC``）：总长严格等于专利 LLM。
+    环平面就是鼻端处两臂的带面（**0 偏航**，盘面与带面贴合）：
+    由切向（直径方向）和鼻端中心线张成。鼻端中心线（环顶点方向，
+    朝轴向端外）与径向直径严格成 ``seita3`` 角——即专利对 seita3
+    的定义，用户改 seita3 时鼻端姿态直接随之旋转；环平面近似贴着
+    圆柱面，并随 ``F`` 向槽底抬高。交叉处两臂所需的错距 ``drop``
+    （由净距需求反解的最小值）沿整个扫角**均匀**消化——环是升角
+    仅几度的浅螺旋（锁紧垫圈式），入口环端在带面上方 ``+drop/2``、
+    出口环端在下方 ``-drop/2``，环中点（鼻尖）严格落在带面内的
+    鼻端中心线上。环沿鼻端中心线的位置由 LLM 反解
+    （``nose_axial_shift``，基准位环心轴向在 ``zn = L2/2 + CC``）：
+    总长严格等于专利 LLM——LLM 差值只由环位/直臂长度吸收，姿态
+    不参与凑长。
 
     多匝在环平面内**同心嵌套**：材料匝 ``i`` 的环半径 =
     ``Rc + HBD*(i-(N-1)/2)``——内匝环小、外匝环大，相邻差一个
@@ -190,11 +283,11 @@ def _nose_layout(res: CoilResult, dr: float = 0.0,
     sin3, cos3 = math.sin(inp.seita3), math.cos(inp.seita3)
     if pose is None:
         pose = _nose_pose(res)
-    shift, yaw = pose
+    shift, drop = pose
     beta = _NOSE_CROSS_BETA
     sweep = math.pi + 2.0 * beta
 
-    def arc_at(positive: bool) -> _Fillet:
+    def arc_at(positive: bool) -> _NoseCurl:
         z_sign = 1.0 if positive else -1.0
         # 交叉接入：环端扫过竖直线 β 后其切向越过中线，+Z 端上层
         # 斜边（来自 -X）自然接到 +X 环端、下层斜边接 -X 环端——
@@ -202,22 +295,17 @@ def _nose_layout(res: CoilResult, dr: float = 0.0,
         sx = 1.0 if positive else -1.0
         # 鼻端中心线（环顶点方向）：与径向直径成 seita3，朝轴向端外。
         axis = b3d.Vector(0, cos3, z_sign * sin3)
-        # 偏航 yaw：环平面绕鼻端中心线转过 yaw，使入口环端（接上层
-        # 斜边）偏向径向内、出口环端偏向径向外——交叉处两臂沿径向
-        # 错开，与真实线圈"环下方一臂压过另一臂"一致。
-        d_in = _rotv(xhat * sx, axis, -sx * yaw).normalized()
+        d_in = xhat * sx
         # 基准位（shift=0）环心在 zn；按 LLM 反解的 shift 沿鼻端
         # 中心线整体内收（shift>0）或外探（shift<0）。
         center = b3d.Vector(0, rn, z_sign * zn) - axis * shift
-        start = center + (d_in * math.cos(beta) - axis * math.sin(beta)) \
-            * radius
-        end = center - (d_in * math.cos(beta) + axis * math.sin(beta)) \
-            * radius
-        # 法向（环绕行角动量）使入口切向 n×(ts-c) = a·cosβ + d_in·sinβ
-        # 朝轴向端外。
+        # 法向（环绕行角动量）使入口切向朝轴向端外。
         normal = d_in.cross(axis)
-        mid = center + axis * radius
-        return _Fillet(start, mid, end, center, normal, sweep)
+        r0 = d_in * math.cos(beta) - axis * math.sin(beta)
+        # -Z 端是 +Z 端的轴向镜像且遍历方向相反（下层→上层），
+        # 错距随之翻号，保证两端交叉处都是"来自较深一侧的臂压过
+        # 另一臂"，整圈保持镜像对称。
+        return _NoseCurl(center, normal, r0, radius, sweep, sx * drop)
 
     base_pos = arc_at(True)
     base_neg = arc_at(False)
@@ -229,9 +317,8 @@ def _nose_layout(res: CoilResult, dr: float = 0.0,
     slot5 = _cyl(res.rr2 + res.hc / 2 + dr, th2, -res.l2 / 2)
     slot0 = _cyl(res.rr1 + res.hc / 2 + dr, th1, -res.l2 / 2)
 
-    def tangent(arc: _Fillet, at_start: bool) -> "b3d.Vector":
-        point = arc.ts if at_start else arc.te
-        return arc.n.cross(point - arc.c).normalized()
+    def tangent(arc: _NoseCurl, at_start: bool) -> "b3d.Vector":
+        return arc.tangent(0.0 if at_start else arc.tau)
 
     def compact_virtual(slot, endpoint, toward_endpoint, radius2: float,
                         label: str) -> "b3d.Vector":
@@ -357,11 +444,44 @@ def _loop_fillets(res: CoilResult, dr: float = 0.0,
     return corners, fillets
 
 
+def _nose_curl_edge(curl: _NoseCurl) -> "b3d.Edge":
+    """卷环束中心线的精确 OCC 边。
+
+    浅螺旋高度剖面 ``h(λ)`` 是三次多项式（smoothstep），因此
+    (u=τλ, v=h(λ)) 是柱面上的一条**精确三次 Bézier** p-curve——
+    几何零误差；3D 表示按 1e-9 容差重建，供 Wire 长度校核使用。
+    drop=0 时退化为精确圆弧。
+    """
+    if abs(curl.drop) <= 1e-12:
+        return b3d.ThreePointArc(curl.ts, curl.ma, curl.te)
+
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+    from OCP.BRepLib import BRepLib
+    from OCP.Geom import Geom_CylindricalSurface
+    from OCP.Geom2d import Geom2d_BezierCurve
+    from OCP.GeomAbs import GeomAbs_Shape
+    from OCP.gp import gp_Ax3, gp_Dir, gp_Pnt, gp_Pnt2d
+    from OCP.TColgp import TColgp_Array1OfPnt2d
+
+    axis = gp_Ax3(gp_Pnt(*curl.c), gp_Dir(*curl.n), gp_Dir(*curl.r0))
+    surface = Geom_CylindricalSurface(axis, curl.radius)
+    half = curl.drop / 2.0
+    poles = TColgp_Array1OfPnt2d(1, 4)
+    poles.SetValue(1, gp_Pnt2d(0.0, half))
+    poles.SetValue(2, gp_Pnt2d(curl.tau / 3.0, half))
+    poles.SetValue(3, gp_Pnt2d(2.0 * curl.tau / 3.0, -half))
+    poles.SetValue(4, gp_Pnt2d(curl.tau, -half))
+    pcurve = Geom2d_BezierCurve(poles)
+    edge = BRepBuilderAPI_MakeEdge(pcurve, surface).Edge()
+    BRepLib.BuildCurves3d_s(edge, 1e-9, GeomAbs_Shape.GeomAbs_C2, 14, 200)
+    return b3d.Edge(edge)
+
+
 def _centerline_edges(res: CoilResult,
                       pose: tuple[float, float] | None = None):
     """构造束中心闭合中心线的解析边及圆角。
 
-    ``pose=(shift, yaw)`` 为卷环姿态；``None`` 使用自动反解值。
+    ``pose=(shift, drop)`` 为卷环姿态；``None`` 使用自动反解值。
     """
     _corners, fillets = _loop_fillets(res, 0.0, pose)
     nose = _nose_layout(res, 0.0, pose)
@@ -376,14 +496,14 @@ def _centerline_edges(res: CoilResult,
     add_fillet(0, fillets[1].ts)
     add_fillet(1, fillets[2].ts)
     add_fillet(2, nose.pos.ts)
-    edges.append(b3d.ThreePointArc(nose.pos.ts, nose.pos.ma, nose.pos.te))
+    edges.append(_nose_curl_edge(nose.pos))
     if (fillets[3].ts - nose.pos.te).length > 1e-6:
         edges.append(b3d.Line(nose.pos.te, fillets[3].ts))
     add_fillet(3, fillets[4].ts)
     add_fillet(4, fillets[5].ts)
     add_fillet(5, fillets[6].ts)
     add_fillet(6, nose.neg.ts)
-    edges.append(b3d.ThreePointArc(nose.neg.ts, nose.neg.ma, nose.neg.te))
+    edges.append(_nose_curl_edge(nose.neg))
     if (fillets[7].ts - nose.neg.te).length > 1e-6:
         edges.append(b3d.Line(nose.neg.te, fillets[7].ts))
     add_fillet(7, fillets[0].ts)
@@ -393,6 +513,10 @@ def _centerline_edges(res: CoilResult,
 # 鼻端卷环的固定交叉半角 β：环扫角 = 180° + 2β。取值使两臂在环
 # 下方明显交叉、环观感接近闭合，与真实涨形线圈照片一致。
 _NOSE_CROSS_BETA = math.radians(25.0)
+
+# 浅螺旋错距 drop 的反解上限 mm（超出说明参数组合无法在贴合带面的
+# 前提下满足交叉净距）。
+_NOSE_DROP_MAX = 60.0
 
 # 环位反解的搜索范围（沿鼻端中心线，正值向铁芯内收）。
 _NOSE_SHIFT_MIN = -80.0
@@ -425,99 +549,128 @@ def _segment_distance(a0, a1, b0, b1) -> float:
     return (a0 + u * s - b0 - v * t).length
 
 
-def _nose_cross_clearance_need(res: CoilResult) -> float:
-    """交叉处入口/出口两臂束中心线所需的最小中心距。
+def _nose_cross_fiber_slack(res: CoilResult,
+                            pose: tuple[float, float]) -> float:
+    """+Z 鼻端交叉区**逐匝纤维**净距裕量（最小值，≥0 即无干涉）。
 
-    交叉区紧邻 rd2 弯角，截面已处于鼻端姿态：宽度方向（束宽 W）
-    沿环平面法向（近似径向）——即两臂错开的方向。所需中心距为
-    "对地方壳外廓半宽 + 导线含匝绝缘半宽 + 裕量"。
+    入口臂（斜边 1→2 + rd2 弯角 2）与出口臂（rd2 弯角 3 + 斜边
+    3→4）各含 N 匝纤维（匝位偏移沿材料 y 轴从槽部 HAD 连续过渡到
+    鼻端 HBD）。对两臂纤维的采样点对，要求中心距 ≥ 双方截面沿
+    连线方向的支撑半宽（含匝绝缘与对地壳厚）之和 + 裕量——束
+    中心线级的净距无法覆盖极限匝纤维在交叉区互相斜穿的情形
+    （v202607142334 已知问题 1 的根源）。-Z 鼻端与 +Z 严格镜像，
+    不再重复计算。
     """
-    inp = res.inp
-    wrap = sum(l.thickness for l in inp.turn_layers if l.thickness > 0)
-    ground = sum(l.thickness for l in inp.layers if l.thickness > 0)
+    import numpy as np
+
     from .engine import strand_grid
 
-    w_env, _h_env, _strands = strand_grid(inp)
-    w_in = w_env + 2 * wrap
-    shell_half_w = 0.5 * (w_in + 2 * ground)
-    wire_half_w = 0.5 * (w_env + 2 * wrap)
-    return shell_half_w + wire_half_w + 2.0 * _NOSE_CROSS_MARGIN
+    inp = res.inp
+    n = inp.n_turns
+    w_env, h_env, _strands = strand_grid(inp)
+    wrap = sum(l.thickness for l in inp.turn_layers if l.thickness > 0)
+    ground = sum(l.thickness for l in inp.layers if l.thickness > 0)
+    half_x = (w_env + 2 * wrap) / 2 + ground
+    h_cap = res.had if n > 1 else h_env + 2 * wrap
+    half_y = min(h_env + 2 * wrap, h_cap) / 2 + ground
+
+    lf = _loop_frames(res, pose)
+    fl = lf.fl
+
+    def dy_slot(i: int) -> float:
+        return res.had * (i - (n - 1) / 2)
+
+    def dy_nose(i: int) -> float:
+        return res.hbd * (i - (n - 1) / 2)
+
+    def slant_samples(key, dy0: float, dy1: float, count: int = 32):
+        f0, f1 = lf.slant_frames[key]
+        law, _slope = lf.slant_laws[key]
+        out = []
+        for k in range(count + 1):
+            lam = k / count
+            f = _twist_frame_at(f0, f1, lam, law)
+            dy = dy0 + (dy1 - dy0) * lam
+            out.append((f.o + f.y * dy, f.x, f.y))
+        return out
+
+    def corner_samples(f: _Frame, fil: _Fillet, dy: float,
+                       count: int = 24):
+        p0 = f.o + f.y * dy
+        out = []
+        for k in range(count + 1):
+            a = fil.tau * k / count
+            out.append((fil.c + _rotv(p0 - fil.c, fil.n, a),
+                        _rotv(f.x, fil.n, a), _rotv(f.y, fil.n, a)))
+        return out
+
+    f12e = lf.slant_frames[(1, 2)][1]        # 位于 fl[2].ts
+    entry, exit_ = [], []
+    for i in range(n):
+        ds, dn = dy_slot(i), dy_nose(i)
+        entry += slant_samples((1, 2), ds, dn)
+        entry += corner_samples(f12e, fl[2], dn)
+        exit_ += corner_samples(lf.f_q3, fl[3], dn)
+        exit_ += slant_samples((3, 4), dn, ds)
+
+    def pack(samples):
+        pts = np.asarray([tuple(p) for p, _x, _y in samples])
+        xs = np.asarray([tuple(x) for _p, x, _y in samples])
+        ys = np.asarray([tuple(y) for _p, _x, y in samples])
+        return pts, xs, ys
+
+    pa, xa, ya = pack(entry)
+    pb, xb, yb = pack(exit_)
+    diff = pa[:, None, :] - pb[None, :, :]
+    dist = np.linalg.norm(diff, axis=-1)
+    dist = np.maximum(dist, 1e-12)
+    dirs = diff / dist[..., None]
+    ra = (np.abs(np.einsum("abk,ak->ab", dirs, xa)) * half_x
+          + np.abs(np.einsum("abk,ak->ab", dirs, ya)) * half_y)
+    rb = (np.abs(np.einsum("abk,bk->ab", dirs, xb)) * half_x
+          + np.abs(np.einsum("abk,bk->ab", dirs, yb)) * half_y)
+    slack = dist - ra - rb - 2.0 * _NOSE_CROSS_MARGIN
+    return float(slack.min())
 
 
 def _nose_pose(res: CoilResult) -> tuple[float, float]:
-    """求解卷环姿态 ``(shift, yaw)`` 并缓存在结果对象上。
+    """求解卷环姿态 ``(shift, drop)`` 并缓存在结果对象上。
 
     ``shift``：环沿鼻端中心线的位置，由闭合中心线总长 == LLM
-    反解；``yaw``：环平面绕鼻端中心线的偏航角，使交叉处入口/出口
-    两臂中心线的净距达到束宽加包覆绝缘的需求。二者耦合，外层对
-    yaw 迭代、内层对 shift 二分。
+    反解；``drop``：浅螺旋错距（入口环端 ``+drop/2``、出口环端
+    ``-drop/2`` 沿环法向），使交叉处入口/出口两臂中心线的净距达到
+    束宽加包覆绝缘的需求。环平面本身始终与带面贴合（0 偏航），
+    seita3 因而直接控制鼻端姿态。二者耦合，外层对 drop 迭代、
+    内层对 shift 二分。
     """
     cached = getattr(res, "_nose_pose3d", None)
     if cached is not None:
         return cached
 
-    need = _nose_cross_clearance_need(res)
+    def slack_at(drop: float) -> float:
+        shift = nose_axial_shift(res, drop)
+        return _nose_cross_fiber_slack(res, (shift, drop))
 
-    def sample_path(chord_a, chord_b, fillet, arc_first: bool,
-                    count: int = 24) -> list:
-        """斜边弦 + rd2 弯角弧的采样点列。"""
-        pts = []
-        arc_pts = [fillet.c + _rotv(fillet.ts - fillet.c, fillet.n,
-                                    fillet.tau * k / count)
-                   for k in range(count + 1)]
-        line_pts = [chord_a + (chord_b - chord_a) * (k / count)
-                    for k in range(count + 1)]
-        if arc_first:
-            pts = arc_pts + line_pts
-        else:
-            pts = line_pts + arc_pts
-        return pts
-
-    def min_dist(pts_a, pts_b) -> float:
-        best = float("inf")
-        for p in pts_a:
-            for q in pts_b:
-                d = (p - q).length
-                if d < best:
-                    best = d
-        return best
-
-    def cross_distance(shift: float, yaw: float) -> float:
-        _corners, fillets = _loop_fillets(res, 0.0, (shift, yaw))
-        entry_pos = sample_path(fillets[1].te, fillets[2].ts,
-                                fillets[2], arc_first=False)
-        exit_pos = sample_path(fillets[3].te, fillets[4].ts,
-                               fillets[3], arc_first=True)
-        entry_neg = sample_path(fillets[5].te, fillets[6].ts,
-                                fillets[6], arc_first=False)
-        exit_neg = sample_path(fillets[7].te, fillets[0].ts,
-                               fillets[7], arc_first=True)
-        return min(min_dist(entry_pos, exit_pos),
-                   min_dist(entry_neg, exit_neg))
-
-    def distance_at(yaw: float) -> float:
-        return cross_distance(nose_axial_shift(res, yaw), yaw)
-
-    # 交叉净距随 yaw 单调增大；对 yaw 二分求"恰好满足净距"的最小
-    # 偏航角（环的倾斜尽可能小、观感最正）。
-    yaw_lo, yaw_hi = 0.0, math.radians(50.0)
-    if distance_at(yaw_lo) >= need - 1e-6:
-        yaw = yaw_lo
+    # 交叉裕量随 drop 单调增大；对 drop 二分求"恰好无干涉"的最小
+    # 错距（螺旋升角尽可能小、盘面观感最平）。
+    drop_lo, drop_hi = 0.0, _NOSE_DROP_MAX
+    if slack_at(drop_lo) >= 0.0:
+        drop = drop_lo
     else:
-        if distance_at(yaw_hi) < need:
+        if slack_at(drop_hi) < 0.0:
             raise ValueError(
                 "nose 交叉处两臂间距无法满足束宽加绝缘的净距需求，"
                 "请调整 RD、rd2、F 或主体尺寸。")
-        for _ in range(10):
-            mid = (yaw_lo + yaw_hi) * 0.5
-            if distance_at(mid) >= need:
-                yaw_hi = mid
+        for _ in range(14):
+            mid = (drop_lo + drop_hi) * 0.5
+            if slack_at(mid) >= 0.0:
+                drop_hi = mid
             else:
-                yaw_lo = mid
-        yaw = yaw_hi
-    shift = nose_axial_shift(res, yaw)
+                drop_lo = mid
+        drop = drop_hi
+    shift = nose_axial_shift(res, drop)
 
-    pose = (shift, yaw)
+    pose = (shift, drop)
     try:
         res._nose_pose3d = pose
     except Exception:
@@ -531,8 +684,10 @@ def _centerline_length(res: CoilResult, pose: tuple[float, float]) -> float:
     _corners, fillets = _loop_fillets(res, 0.0, pose)
     nose = _nose_layout(res, 0.0, pose)
 
-    def arc_len(fil: _Fillet) -> float:
-        return (fil.ts - fil.c).length * fil.tau
+    def arc_len(seg) -> float:
+        if isinstance(seg, _NoseCurl):
+            return seg.length()
+        return (seg.ts - seg.c).length * seg.tau
 
     order = [fillets[0], fillets[1], fillets[2], nose.pos,
              fillets[3], fillets[4], fillets[5], fillets[6], nose.neg,
@@ -544,18 +699,18 @@ def _centerline_length(res: CoilResult, pose: tuple[float, float]) -> float:
     return total
 
 
-def nose_axial_shift(res: CoilResult, yaw: float | None = None) -> float:
+def nose_axial_shift(res: CoilResult, drop: float | None = None) -> float:
     """由专利平均匝长反解卷环沿鼻端中心线的位置偏移。
 
     偏移增大（环向铁芯内收）时两侧斜边缩短、闭合中心线单调变短；
     用二分求得总长严格等于 LLM 的偏移。基准位（偏移=0）环心轴向
     在 ``zn = L2/2 + CC``。
     """
-    if yaw is None:
+    if drop is None:
         return _nose_pose(res)[0]
 
     def length_at(shift: float) -> float:
-        return _centerline_length(res, (shift, yaw))
+        return _centerline_length(res, (shift, drop))
 
     def bracket(lo: float, hi: float, samples: int = 24):
         """在可行区间内寻找 length-LLM 变号的一段。"""
@@ -741,8 +896,8 @@ class _LoopFrames:
     f_flat_pos_out: _Frame       # +Z 卷环出口框架
     f_flat_neg: _Frame           # -Z 卷环入口框架
     f_flat_neg_out: _Frame       # -Z 卷环出口框架
-    nose_pos: _Fillet            # +Z 交叉卷环（扫角 180°+2β）
-    nose_neg: _Fillet            # -Z 交叉卷环
+    nose_pos: _NoseCurl          # +Z 交叉卷环（扫角 180°+2β，浅螺旋）
+    nose_neg: _NoseCurl          # -Z 交叉卷环
     slant_frames: dict           # {(i_from,i_to): (f_start, f_end)} 斜边两端框架
     slant_laws: dict             # {(i_from,i_to): (law, slope)} 斜边扭转分布律
     f_q2: _Frame                 # +Z 入口 rd2 弯角出口框架（Q2，卷环姿态）
@@ -787,10 +942,11 @@ def _mirrored_law(law):
     return mirrored
 
 
-def _loop_frames(res: CoilResult) -> _LoopFrames:
-    corners, fl = _loop_fillets(res, 0.0)
+def _loop_frames(res: CoilResult,
+                 pose: tuple[float, float] | None = None) -> _LoopFrames:
+    corners, fl = _loop_fillets(res, 0.0, pose)
     c = [x[0] for x in corners]
-    nose = _nose_layout(res, 0.0)
+    nose = _nose_layout(res, 0.0, pose)
 
     f_leg1 = _anchor(fl[0].te, c[1] - c[0],
                      _radial_of((c[0] + c[1]) * 0.5) * -1.0)
@@ -805,15 +961,14 @@ def _loop_frames(res: CoilResult) -> _LoopFrames:
 
     # 卷环姿态：材料 y 轴 = 环平面内指向环外的半径方向（同心嵌套
     # 的匝位方向，dy>0 = 环更大 = 原始外匝）。rd2 弯角零扭转：斜边
-    # 鼻侧端框架由卷环姿态经弯角刚性反推/传递。
-    def crown_frames(arc: _Fillet, entry_corner: int):
-        tangent_in = arc.n.cross(arc.ts - arc.c).normalized()
-        y_in = (arc.ts - arc.c).normalized()
-        f_in = _Frame(arc.ts, y_in.cross(tangent_in).normalized(),
-                      y_in, tangent_in)
+    # 鼻侧端框架由卷环姿态经弯角刚性反推/传递。浅螺旋高度剖面在
+    # 环两端斜率为零，故环端切向就在环平面内，框架与平面 rd2 圆角
+    # 严格 G1 对接。
+    def crown_frames(arc: _NoseCurl, entry_corner: int):
+        f_in = arc.frame(0.0)
         f_end = _pre_corner(f_in.at(fl[entry_corner].te),
                             fl[entry_corner]).at(fl[entry_corner].ts)
-        f_out = _transport(f_in.at(arc.ts), arc)
+        f_out = arc.frame(arc.tau)
         return f_in, f_out, f_end
 
     f_flat_pos, f_flat_pos_out, f12e = crown_frames(nose.pos, 2)
@@ -843,9 +998,9 @@ def _loop_frames(res: CoilResult) -> _LoopFrames:
 def _loop_segments(res: CoilResult) -> list:
     """一圈闭合环路的分段序列（方壳/简化束用）。
 
-    直线边为锚定棱柱，nose 为真实 RD 半圆旋转体，圆角为旋转体。
+    直线边为锚定棱柱，圆角为旋转体，nose 为浅螺旋密站位直纹放样。
     槽侧姿态到圆冠姿态的截面扭转压缩在斜边贴近鼻部的扭转段内；
-    rd2 弯角、直鼻臂和圆冠零扭转。
+    rd2 弯角、直鼻臂和卷环零扭转。
     """
     lf = _loop_frames(res)
     fl = lf.fl
@@ -863,13 +1018,13 @@ def _loop_segments(res: CoilResult) -> list:
         segs.append(_Rev(f_end, fl[i_to]))
 
     def nose(f_q_in: _Frame, f_q_out: _Frame,
-             f_crown_in: _Frame, f_crown_out: _Frame, arc: _Fillet,
+             f_crown_in: _Frame, f_crown_out: _Frame, arc: _NoseCurl,
              i_enter: int, i_exit: int):
         pre_len = (arc.ts - fl[i_enter].te).length
         if pre_len > 1e-6:
             segs.extend(_twisted_lofts(f_q_in.at(fl[i_enter].te),
                                        f_crown_in.at(arc.ts)))
-        segs.append(_Rev(f_crown_in.at(arc.ts), arc))
+        segs.append(_nose_transition(arc, 0.0, 0.0))
         post_len = (fl[i_exit].ts - arc.te).length
         if post_len > 1e-6:
             segs.extend(_twisted_lofts(f_crown_out.at(arc.te),
@@ -965,39 +1120,42 @@ def _twisted_lofts(f0: _Frame, f1: _Frame,
             for j in range(count)]
 
 
-def _nose_transition(arc: _Fillet, dy0: float, dy1: float,
+def _nose_transition(arc: _NoseCurl, dy0: float, dy1: float,
                      count: int = 32) -> _MultiLoft:
     """沿交叉卷环把匝位从 ``dy0`` 光顺换到 ``dy1``（同心螺旋入环）。
 
     匝位偏移 dy 沿环平面内的旋转半径方向施加：换匝曲线是从半径
-    ``Rc+dy0`` 平滑过渡到 ``Rc+dy1`` 的平面螺旋，与涨形前梭形
-    线圈相邻两匝在鼻端的自然接续一致。smoothstep 的一阶导数在
-    两端为零，因此与前后的 rd2 圆角 G1 对接；截面 ex 恒为环平面
-    法向（与 dy 无关），相邻换匝截面严格共面嵌套。
+    ``Rc+dy0`` 平滑过渡到 ``Rc+dy1`` 的同心螺旋，与涨形前梭形
+    线圈相邻两匝在鼻端的自然接续一致；``dy0==dy1`` 时即匝位不变
+    的整环。卷环自身的浅螺旋错距（``_NoseCurl.height``）与匝位
+    无关地叠加在环法向上。smoothstep 的一阶导数在两端为零，因此
+    与前后的 rd2 圆角 G1 对接；截面 ex 恒为环平面法向（与 dy 和
+    错距无关），相邻匝截面严格共面嵌套、匝间只共享边界。
 
     放样按**密站位直纹**：相邻截面间线性插值，SolidWorks 兼容的
     split-5 条带才能与整环放样严格互补（体积守恒、只共享边界）；
     站位角步距 ≤4°，弦高误差远小于制造公差。
     """
-    radius = (arc.ts - arc.c).length
+    radius = arc.radius
     if radius <= 1e-9 or arc.tau <= 1e-9:
         raise ValueError("nose 卷环弧长必须大于 0")
     count = max(int(count), math.ceil(arc.tau / math.radians(4.0)))
-    y0 = (arc.ts - arc.c).normalized()
     total = radius * arc.tau
     delta = dy1 - dy0
 
     sections: list[_Basis] = []
     for j in range(count + 1):
         lam = j / count
-        y = _rotv(y0, arc.n, arc.tau * lam).normalized()
+        theta = arc.tau * lam
+        y = arc.ydir(theta)
         planar_t = arc.n.cross(y)
         blend = _smoothstep(lam)
         dy = dy0 + delta * blend
         dy_rate = delta * 6.0 * lam * (1.0 - lam) / total
         tangent = (planar_t * ((radius + dy) / radius)
-                   + y * dy_rate).normalized()
-        center = arc.c + y * (radius + dy)
+                   + y * dy_rate
+                   + arc.n * (arc.dheight(theta) / radius)).normalized()
+        center = arc.point(theta, dy)
         x = y.cross(planar_t).normalized()   # = ±环平面法向
         sections.append(_Basis(center, x, y, tangent))
     return _MultiLoft(sections, (), (True,))
@@ -1061,13 +1219,13 @@ def _wire_segments(res: CoilResult):
 
     def add_constant_nose(f_q_in: _Frame, f_q_out: _Frame,
                           f_crown_in: _Frame, f_crown_out: _Frame,
-                          arc: _Fillet,
+                          arc: _NoseCurl,
                           i_enter: int, i_exit: int, d: float) -> None:
         pre_len = (arc.ts - fl[i_enter].te).length
         if pre_len > 1e-6:
             segs.extend(_twisted_lofts(f_q_in.at(fl[i_enter].te),
                                        f_crown_in.at(arc.ts), d, d))
-        segs.append(_Rev(f_crown_in.at(arc.ts), arc, dy=d))
+        segs.append(_nose_transition(arc, d, d))
         post_len = (fl[i_exit].ts - arc.te).length
         if post_len > 1e-6:
             segs.extend(_twisted_lofts(f_crown_out.at(arc.te),
@@ -1490,13 +1648,13 @@ def _multiloft_ring_strips(seg: _MultiLoft,
             f"外截面={w2:.6g}×{h2:.6g}mm")
 
     specs = (
-        ("换匝段-左侧条带", side_w, h2,
+        ("卷环段-左侧条带", side_w, h2,
          xo - (w1 + w2) / 4.0, yo),
-        ("换匝段-右侧条带", side_w, h2,
+        ("卷环段-右侧条带", side_w, h2,
          xo + (w1 + w2) / 4.0, yo),
-        ("换匝段-上侧条带", w1, cap_h,
+        ("卷环段-上侧条带", w1, cap_h,
          xo, yo + (h1 + h2) / 4.0),
-        ("换匝段-下侧条带", w1, cap_h,
+        ("卷环段-下侧条带", w1, cap_h,
          xo, yo - (h1 + h2) / 4.0),
     )
     result = []
@@ -1567,8 +1725,8 @@ def _continuous_ring_shell_parts(segs: list,
         transition_no += 1
         for label, strip in _multiloft_ring_strips(
                 segment, w1, h1, w2, h2, xo, yo):
-            side = label.removeprefix("换匝段-")
-            result.append((f"换匝{transition_no}-{side}", strip))
+            side = label.removeprefix("卷环段-")
+            result.append((f"卷环{transition_no}-{side}", strip))
     flush_ordinary()
 
     if transition_no != transition_count:
@@ -1581,25 +1739,11 @@ def _turn_mica_shell_parts(segs: list,
                            w2: float, h2: float) -> list[tuple[str, object]]:
     """构造一个材料匝的云母实体叶节点。
 
-    普通匝保持单一完整实体；含一个换匝 ``_MultiLoft`` 的匝输出
-    ``主体 + 左/右/上/下条带`` 五个互相独立的实体。当前连续绕线路径
-    把换匝段放在该材料匝分段的首位，因而去掉它后的其余路径仍是一件
-    连续主体。
+    每个卷环/换匝 ``_MultiLoft``（+Z 换匝螺旋、±Z 整环）拆成
+    左/右/上/下四条无孔实心条带，其间的普通解析路径各自融合为
+    一件主体——与 ``_continuous_ring_shell_parts`` 同一策略。
     """
-    transition_ids = [index for index, segment in enumerate(segs)
-                      if isinstance(segment, _MultiLoft)]
-    if not transition_ids:
-        return [("", _continuous_path_shell(segs, w1, h1, w2, h2))]
-    if len(transition_ids) != 1 or transition_ids[0] != 0:
-        raise RuntimeError(
-            "匝间云母 split-5 要求每个材料匝至多含一个且位于首段的换匝放样")
-
-    transition = segs[0]
-    rest = _continuous_path_shell(segs[1:], w1, h1, w2, h2)
-    if rest is None or len(rest.solids()) != 1:
-        raise RuntimeError("换匝段以外的匝间云母主体未生成单一实体")
-    return [("主体", rest.solids()[0]),
-            *_multiloft_ring_strips(transition, w1, h1, w2, h2)]
+    return _continuous_ring_shell_parts(segs, w1, h1, w2, h2)
 
 
 # ======================================================================

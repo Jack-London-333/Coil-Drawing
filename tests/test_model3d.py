@@ -34,12 +34,12 @@ def test_loop_material_frame_orientation(small_res):
         pytest.approx(1.0, abs=1e-10)
     # 卷环入口/出口框架 y = 环平面内指向环外的半径方向（同心嵌套
     # 匝位方向），与环法向垂直。
-    for frame, arc, point in (
-            (frames.f_flat_pos, frames.nose_pos, frames.nose_pos.ts),
-            (frames.f_flat_pos_out, frames.nose_pos, frames.nose_pos.te),
-            (frames.f_flat_neg, frames.nose_neg, frames.nose_neg.ts),
-            (frames.f_flat_neg_out, frames.nose_neg, frames.nose_neg.te)):
-        y_expect = np.asarray(tuple((point - arc.c).normalized()))
+    for frame, arc, theta in (
+            (frames.f_flat_pos, frames.nose_pos, 0.0),
+            (frames.f_flat_pos_out, frames.nose_pos, frames.nose_pos.tau),
+            (frames.f_flat_neg, frames.nose_neg, 0.0),
+            (frames.f_flat_neg_out, frames.nose_neg, frames.nose_neg.tau)):
+        y_expect = np.asarray(tuple(arc.ydir(theta)))
         y = np.asarray(tuple(frame.y))
         np.testing.assert_allclose(y, y_expect, atol=1e-10)
         assert abs(frame.y.dot(arc.n)) == pytest.approx(0.0, abs=1e-10)
@@ -131,37 +131,51 @@ def test_four_turn_material_mapping_matches_formed_coil():
 
 def test_nose_is_crossed_curl_with_patent_centerline_radius():
     """鼻端是交叉卷环：中心线半径 Rc=RD+WA/2，扫角 180°+2β，
-    环顶方向（鼻端中心线）与径向直径成 seita3、朝轴向端外。"""
+    环顶方向（鼻端中心线）与径向直径成 seita3、朝轴向端外；
+    盘面法向与带面法向一致（0 偏航），交叉错距是沿盘面法向的
+    浅螺旋（入口 +drop/2、出口 -drop/2，鼻尖严格在盘面内）。"""
     from coildrawing import model3d as m
 
     inp = CoilInput(rd_nose=18.0, seita3=math.radians(80.0))
     res = compute(inp)
     layout = m._nose_layout(res)
+    _shift, drop = m._nose_pose(res)
     radial = m.b3d.Vector(0, 1, 0)
     center_radius = inp.rd_nose + res.wa_turn / 2
     sweep = math.pi + 2.0 * m._NOSE_CROSS_BETA
     for arc, z_sign in ((layout.pos, 1.0), (layout.neg, -1.0)):
-        assert (arc.ts - arc.c).length == pytest.approx(center_radius, abs=1e-9)
-        assert (arc.ma - arc.c).length == pytest.approx(center_radius, abs=1e-9)
-        assert (arc.te - arc.c).length == pytest.approx(center_radius, abs=1e-9)
+        assert arc.radius == pytest.approx(center_radius, abs=1e-9)
         assert center_radius - res.wa_turn / 2 == pytest.approx(
             inp.rd_nose, abs=1e-10)
+        # 环平面内半径恒等于 Rc；错距只出现在盘面法向上。
+        for point, height in ((arc.ts, drop / 2), (arc.ma, 0.0),
+                              (arc.te, -drop / 2)):
+            v = point - arc.c
+            off = v.dot(arc.n)
+            assert abs(off) == pytest.approx(abs(height), abs=1e-9)
+            assert (v - arc.n * off).length == pytest.approx(
+                center_radius, abs=1e-9)
         # 扫角超过 180°（交叉卷回，观感接近闭合的圆环）。
         assert arc.tau == pytest.approx(sweep, abs=1e-12)
         assert arc.tau > math.pi
         # 环顶方向 = 鼻端中心线：与径向直径成 seita3、朝轴向端外。
+        # 鼻尖（环中点）严格位于盘面内的鼻端中心线上。
         axis = (arc.ma - arc.c).normalized()
         assert axis.X == pytest.approx(0.0, abs=1e-10)
         angle = math.acos(max(-1.0, min(1.0, axis.dot(radial))))
         assert angle == pytest.approx(inp.seita3, abs=1e-10)
         assert z_sign * axis.Z > 0
-        # 环平面法向与鼻端中心线垂直（环贴着圆柱面、含偏航倾斜）。
+        # 盘面法向与鼻端中心线垂直，且 = 带面法向（0 偏航）：
+        # n 在切向-中心线平面外无分量。
         assert arc.n.dot(axis) == pytest.approx(0.0, abs=1e-10)
-        # 弧端点/中点自洽。
-        end_check = arc.c + m._rotv(arc.ts - arc.c, arc.n, arc.tau)
-        mid_check = arc.c + m._rotv(arc.ts - arc.c, arc.n, arc.tau / 2)
-        assert (end_check - arc.te).length < 1e-9
-        assert (mid_check - arc.ma).length < 1e-9
+        assert arc.n.X == pytest.approx(0.0, abs=1e-10)
+        # 螺旋端点斜率为零：环端切向严格在盘面内（与 rd2 G1 对接）。
+        assert arc.tangent(0.0).dot(arc.n) == pytest.approx(0.0, abs=1e-12)
+        assert arc.tangent(arc.tau).dot(arc.n) == pytest.approx(
+            0.0, abs=1e-12)
+        # 端点/中点与参数化自洽。
+        assert (arc.point(arc.tau) - arc.te).length < 1e-9
+        assert (arc.point(arc.tau / 2) - arc.ma).length < 1e-9
 
 
 @pytest.mark.parametrize("degrees", [70.0, 80.0, 90.0])
@@ -195,17 +209,21 @@ def test_nose_turns_are_concentric_with_hbd_radial_pitch():
     for arc, entry in cases:
         # 匝位轴 = 环平面内指向环外的半径方向。
         assert tuple(entry.y) == pytest.approx(
-            tuple((arc.ts - arc.c).normalized()), abs=1e-10)
+            tuple(arc.ydir(0.0)), abs=1e-10)
         for lam in (0.0, 0.25, 0.5, 0.75, 1.0):
-            y_dir = m._rotv((arc.ts - arc.c).normalized(), arc.n,
-                            arc.tau * lam)
+            theta = arc.tau * lam
+            y_dir = arc.ydir(theta)
             for d_left, d_right in zip(dys, dys[1:]):
-                left = arc.c + y_dir * (rc + d_left)
-                right = arc.c + y_dir * (rc + d_right)
+                left = arc.point(theta, d_left)
+                right = arc.point(theta, d_right)
                 offset = right - left
-                # 同心圆环：同弧位相邻匝严格沿环半径方向相差 HBD。
+                # 同心嵌套：同弧位相邻匝严格沿环半径方向相差 HBD
+                # （浅螺旋高度与匝位无关，不改变匝间距）。
                 assert offset.length == pytest.approx(res.hbd, abs=1e-10)
-                assert (left - arc.c).length == pytest.approx(
+                assert tuple(offset.normalized()) == pytest.approx(
+                    tuple(y_dir), abs=1e-10)
+                in_plane = (left - arc.c) - arc.n * (left - arc.c).dot(arc.n)
+                assert in_plane.length == pytest.approx(
                     rc + d_left, abs=1e-10)
 
 
@@ -225,8 +243,8 @@ def test_nose_transition_is_concentric_spiral_g1_at_both_ends():
     transition = m._nose_transition(arc, d0, d1)
     shifted = m._nose_transition(arc, d0 + res.hbd, d1 + res.hbd)
     first, last = transition.sections[0], transition.sections[-1]
-    t0 = arc.n.cross(arc.ts - arc.c).normalized()
-    t1 = arc.n.cross(arc.te - arc.c).normalized()
+    t0 = arc.tangent(0.0)
+    t1 = arc.tangent(arc.tau)
 
     # 两端与 rd2 圆角端面逐点对接：位置沿环半径方向偏移，切向等于
     # 解析切向。
@@ -251,10 +269,11 @@ def test_nose_transition_is_concentric_spiral_g1_at_both_ends():
         assert section.ey.dot(plane_normal) == pytest.approx(0.0, abs=1e-10)
         assert abs(section.ex.dot(plane_normal)) == pytest.approx(
             1.0, abs=1e-10)
-        # 换匝曲线是从 Rc+d0 到 Rc+d1 的同心螺旋。
-        r_here = (section.o - arc.c).length
-        assert min(d0, d1) - 1e-9 <= \
-            r_here - (arc.ts - arc.c).length <= max(d0, d1) + 1e-9
+        # 换匝曲线的环平面内半径从 Rc+d0 单调过渡到 Rc+d1
+        # （浅螺旋高度在环法向上，另行叠加）。
+        v_here = section.o - arc.c
+        r_here = (v_here - plane_normal * v_here.dot(plane_normal)).length
+        assert min(d0, d1) - 1e-9 <= r_here - arc.radius <= max(d0, d1) + 1e-9
 
 
 def test_crossed_curl_centerline_is_exactly_llm():
@@ -274,8 +293,7 @@ def test_crossed_curl_centerline_is_exactly_llm():
     assert tuple(layout.q3) == pytest.approx(tuple(layout.pos.te), abs=1e-12)
 
     # rd2 与环 G1 相切：圆角出口切向 == 环入口切向。
-    tangent_in = layout.pos.n.cross(
-        layout.pos.ts - layout.pos.c).normalized()
+    tangent_in = layout.pos.tangent(0.0)
     corner_out = fillets[2].n.cross(layout.q2 - fillets[2].c).normalized()
     assert tuple(corner_out) == pytest.approx(tuple(tangent_in), abs=1e-9)
 
@@ -493,10 +511,14 @@ def test_common_large_seita3_nose_is_compact_and_exactly_tangent(degrees):
 
 
 def test_infeasible_nose_parameters_fail_instead_of_growing_hairpin():
-    """无解参数须明确拒绝，不得恢复米级虚拟切线的旧行为。"""
+    """无解参数须明确拒绝，不得恢复米级虚拟切线的旧行为。
+
+    rd2=100 在 0 偏航浅螺旋姿态下已真实可行（旧 yaw 姿态的几何
+    挤压消失），这里用 rd2=150 仍然超出 LLM 可行域的组合。
+    """
     from coildrawing import model3d as m
 
-    inp = CoilInput(seita3=math.radians(80.0), r_bend_nose=100.0)
+    inp = CoilInput(seita3=math.radians(80.0), r_bend_nose=150.0)
     with pytest.raises(ValueError,
                        match="参数组合几何不可行|平均匝长|净距需求"):
         m._nose_layout(compute(inp))
@@ -595,11 +617,12 @@ def test_detailed_parts_geometry(small_res):
     names = [p.name for p in parts]
     assert names[0] == "铜导线"
     turn_names = [n for n in names if n.startswith("匝绝缘1")]
-    # 第一材料匝没有换匝段，仍是一件；其余每匝均拆成
-    # 主体 + 左/右/上/下四条带。
-    assert len(turn_names) == 1 + 5 * (small_res.inp.n_turns - 1)
-    assert any(n.endswith("-主体") for n in turn_names)
-    assert any(n.endswith("-换匝段-左侧条带") for n in turn_names)
+    # 每个卷环/换匝密站位放样拆成四条无孔条带，其余解析路径融合为
+    # 主体段。n=2：第一材料匝含 1 个 -Z 卷环（6 件）；第二材料匝含
+    # +Z 换匝卷环 + -Z 卷环（10 件）。
+    assert len(turn_names) == 6 + 10
+    assert any("-主体段" in n for n in turn_names)
+    assert any(n.endswith("-左侧条带") for n in turn_names)
     assert sum(1 for n in names if n.startswith("对地绝缘")) == 2
     assert sum(1 for n in names if n.startswith("防晕层")) == 2
     assert sum(1 for n in names if n.startswith("层间垫片")) == 2
@@ -656,7 +679,9 @@ def test_turn_mica_split_leaves_are_strict_low_tolerance_solids():
     for start, end, material_i in info["turn_ranges"]:
         leaves = m._turn_mica_shell_parts(
             segs[start:end], w_env, h_env, w2, h2)
-        assert len(leaves) == (1 if material_i == inp.n_turns - 1 else 5)
+        # 首个材料匝：1 个 -Z 卷环 → 2 主体段 + 4 条带；其余材料匝：
+        # +Z 换匝卷环 + -Z 卷环 → 2 主体段 + 8 条带。
+        assert len(leaves) == (6 if material_i == inp.n_turns - 1 else 10)
         for suffix, shell in leaves:
             shape = shell.wrapped
             label = f"第{material_i + 1}匝-{suffix or '完整匝'}"
@@ -697,13 +722,25 @@ def test_strand_self_insulation_multiloft_is_split_into_solids():
         strand["bi"], strand["hi"], strand["x"], strand["y"])
 
     labels = [label for label, _shape in leaves]
+    # n=2 全路径含 3 个卷环密站位放样：第一匝 -Z 卷环、+Z 换匝
+    # 卷环、第二匝 -Z 卷环。
     assert labels == [
         "主体段1",
-        "换匝1-左侧条带",
-        "换匝1-右侧条带",
-        "换匝1-上侧条带",
-        "换匝1-下侧条带",
+        "卷环1-左侧条带",
+        "卷环1-右侧条带",
+        "卷环1-上侧条带",
+        "卷环1-下侧条带",
         "主体段2",
+        "卷环2-左侧条带",
+        "卷环2-右侧条带",
+        "卷环2-上侧条带",
+        "卷环2-下侧条带",
+        "主体段3",
+        "卷环3-左侧条带",
+        "卷环3-右侧条带",
+        "卷环3-上侧条带",
+        "卷环3-下侧条带",
+        "主体段4",
     ]
     assert len(labels) == len(set(labels))
     for label, shape in leaves:
@@ -773,12 +810,19 @@ def test_reported_t7_mica_split5_preserves_volume_and_has_no_interference():
     h2 = min(h1 + 2 * layer.thickness, res.had)
 
     leaves = m._turn_mica_shell_parts(segs[start:end], w1, h1, w2, h2)
+    # T7 材料匝以 +Z 换匝卷环开始，中段含 -Z 卷环：
+    # 4+1+4+1 = 10 个叶节点。
     assert [suffix for suffix, _shape in leaves] == [
-        "主体",
-        "换匝段-左侧条带",
-        "换匝段-右侧条带",
-        "换匝段-上侧条带",
-        "换匝段-下侧条带",
+        "卷环1-左侧条带",
+        "卷环1-右侧条带",
+        "卷环1-上侧条带",
+        "卷环1-下侧条带",
+        "主体段1",
+        "卷环2-左侧条带",
+        "卷环2-右侧条带",
+        "卷环2-上侧条带",
+        "卷环2-下侧条带",
+        "主体段2",
     ]
     for suffix, shape in leaves:
         assert shape.wrapped.ShapeType() == TopAbs_ShapeEnum.TopAbs_SOLID, suffix
